@@ -35,6 +35,7 @@ QWEN21_MODEL = "Qwen/Qwen-Image-2.1"
 QWEN21_MIN_TRANSFORMERS = (5, 17)  # QwenImage21Pipeline needs transformers>=5.17
 QWEN21_DEFAULT_STEPS = 40
 QWEN21_MAX_CONDITION_IMAGES = 10
+QWEN21_DEFAULT_MAX_SIDE = 1024  # memory-safe default; ~15B params total (7B DiT + 8B text encoder + VAE)
 
 LORA_CACHE_DIR = Path.home() / ".cache" / "flux-batch" / "loras"
 LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -186,6 +187,7 @@ def main():
     parser.add_argument("-sd", "--seed", type=int, default=42, help="Random seed (default: 42)")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {ver}")
     parser.add_argument("-w", "--width", type=int, help="Explicit output width (enforced)")
+    parser.add_argument("--output-resolution", type=int, default=QWEN21_DEFAULT_MAX_SIDE, help="Qwen-Image-2.1 only: target side length every condition/reference image is resized to before encoding (default: 1024). Each ref is inflated to this regardless of its source size; lower it (e.g. 512) to fit many refs in ~24 GB VRAM")
     parser.add_argument('--offset', type=int, default=0, help='Start reading prompt file from this line (default: 0)')
     parser.add_argument('-nc', '--no-clobber', action='store_true', dest='nc', help='No Clobber')
 
@@ -754,6 +756,11 @@ def main():
                 continue
 
             if args.model == "qwen-image-2.1":
+                if not (args.width or args.height or args.max_width or args.max_height):
+                    if max(w, h) > QWEN21_DEFAULT_MAX_SIDE:
+                        _clamp = QWEN21_DEFAULT_MAX_SIDE / max(w, h)
+                        w, h = int(w * _clamp), int(h * _clamp)
+                        print(f"Qwen-Image-2.1: clamped output to {w}x{h} (max side {QWEN21_DEFAULT_MAX_SIDE}; use -w/-h or --max-width/--max-height to raise)", file=sys.stderr)
                 qwen_steps = args.steps if args.steps != 4 else QWEN21_DEFAULT_STEPS
                 generator = torch.Generator(device=args.device).manual_seed(args.seed)
                 pipe_kwargs = dict(
@@ -785,6 +792,8 @@ def main():
                     refs_for_qwen = refs_for_qwen[:QWEN21_MAX_CONDITION_IMAGES]
                 if refs_for_qwen:
                     pipe_kwargs["image"] = refs_for_qwen[0] if len(refs_for_qwen) == 1 else refs_for_qwen
+                if refs_for_qwen or args.output_resolution != QWEN21_DEFAULT_MAX_SIDE:
+                    pipe_kwargs["output_resolution"] = args.output_resolution
                 result = pipe(**pipe_kwargs)
                 image = result.images[0]
                 write_image(image, outpath, prompt, args.seed)
