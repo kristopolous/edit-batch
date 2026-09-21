@@ -250,7 +250,6 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--shuf` | false | Shuffle input file order randomly |
 | `-nc` | false | No Clobber — skip existing outputs |
 | `--model` | `flux` | Model backend: `flux`, `hidream`, `boogu`, or `qwen-image-2.1` |
-
 | `--model-type` | `full` | HiDream variant: `full` (25 steps) or `dev` (28 steps) |
 | `--guidance-scale` | * | HiDream guidance scale (5.0 full, 0.0 dev) |
 | `--text-guidance-scale` | `5.0` | Text guidance scale for Boogu |
