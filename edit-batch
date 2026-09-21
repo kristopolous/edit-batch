@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch-process images through FLUX.2 klein (GGUF Q4), HiDream-O1-Image, or Boogu-Image-0.1-Edit with a single prompt."""
+"""Batch-process images through FLUX.2 klein (GGUF Q4), HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 with a single prompt."""
 
 import argparse
 import json
@@ -30,6 +30,11 @@ BOOGU_EDIT_MODEL = "Boogu/Boogu-Image-0.1-Edit"
 BOOGU_EDIT_TURBO_MODEL = "Boogu/Boogu-Image-0.1-Edit-Turbo"
 BOOGU_REPO = "https://github.com/BOOGU-Project/Boogu-Image.git"
 BOOGU_GGUF_URL = "https://huggingface.co/realrebelai/Boogu-Image-Edit-Turbo_GGUFs/resolve/main/boogu-edit-turbo-dit-Q4_1.gguf"
+
+QWEN21_MODEL = "Qwen/Qwen-Image-2.1"
+QWEN21_MIN_TRANSFORMERS = (5, 17)  # QwenImage21Pipeline needs transformers>=5.17
+QWEN21_DEFAULT_STEPS = 40
+QWEN21_MAX_CONDITION_IMAGES = 10
 
 LORA_CACHE_DIR = Path.home() / ".cache" / "flux-batch" / "loras"
 LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,7 +137,7 @@ def apply_canny(skeleton):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch image processing with FLUX.2 klein Q4 GGUF, HiDream-O1-Image, or Boogu-Image-0.1-Edit",
+        description="Batch image processing with FLUX.2 klein Q4 GGUF, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -172,7 +177,7 @@ def main():
     ## -h is help
     parser.add_argument("--height", type=int, help="Explicit output height (enforced)")
     parser.add_argument("-i", "--in", dest="input_glob", help="Glob pattern for input images (e.g. '*.jpg')")
-    parser.add_argument("-m", "--model", default="flux", choices=["flux", "hidream", "boogu"], help="Model to use (default: flux)")
+    parser.add_argument("-m", "--model", default="flux", choices=["flux", "hidream", "boogu", "qwen-image-2.1"], help="Model to use (default: flux)")
     parser.add_argument("-o", "--out", required=True, dest="output_dir", help="Directory to write output images")
     parser.add_argument("-p", "--prompt", required=True, help="Prompt from a file applied to every image")
     parser.add_argument("-r", "--ref", action="append", dest="refs", metavar="IMAGE", help="Reference image(s), can be specified multiple times")
@@ -190,6 +195,21 @@ def main():
     from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel, GGUFQuantizationConfig, FluxControlNetPipeline
     from diffusers.models.controlnets.controlnet_flux import FluxControlNetModel
     from diffusers.utils import load_image
+
+    def _read_ref_file(path, prev_content, prev_images):
+        """Re-read a reference-image file; reload images only when content changes."""
+        with open(path) as f:
+            content = f.read()
+        if content == prev_content:
+            return prev_content, prev_images
+        images = []
+        for r in (line.strip() for line in content.splitlines() if line.strip()):
+            try:
+                images.append(load_image(r))
+            except Exception as e:
+                print(f"Error loading ref {r}: {e}, skipping", file=sys.stderr)
+        print(f"New references: {', '.join(line.strip() for line in content.splitlines() if line.strip())}")
+        return content, images
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -439,6 +459,29 @@ def main():
             if args.text_guidance_scale == 5.0 and args.image_guidance_scale == 1.0:
                 print("DMD turbo: overriding text_guidance_scale to 1.0 (use --text-guidance-scale to override)", file=sys.stderr)
                 args.text_guidance_scale = 1.0
+    elif args.model == "qwen-image-2.1":
+        try:
+            from diffusers import QwenImage21Pipeline
+        except ImportError:
+            print("Error: --model qwen-image-2.1 requires a diffusers release with QwenImage21Pipeline", file=sys.stderr)
+            print("       (merged upstream in PR #14804; not yet in pip releases).", file=sys.stderr)
+            print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers'", file=sys.stderr)
+            sys.exit(1)
+        import transformers as _qtf
+        try:
+            _qver = tuple(int(p) for p in _qtf.__version__.split(".")[:2])
+        except Exception:
+            _qver = (0, 0)
+        if _qver < QWEN21_MIN_TRANSFORMERS:
+            print(f"Error: --model qwen-image-2.1 requires transformers>={'.'.join(map(str, QWEN21_MIN_TRANSFORMERS))} (found {_qtf.__version__}).", file=sys.stderr)
+            print("       Install: pip install -U 'transformers>=5.17'", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loading {QWEN21_MODEL} ...", file=sys.stderr)
+        t0 = time.time()
+        pipe = QwenImage21Pipeline.from_pretrained(QWEN21_MODEL, torch_dtype=torch.bfloat16)
+        pipe.enable_model_cpu_offload()
+        t1 = time.time()
+        print(f"Qwen-Image-2.1 model ready in {t1 - t0:.1f}s", file=sys.stderr)
     elif args.skeleton:
         from transformers import AutoModel, AutoTokenizer
         print(f"Loading ControlNet pipeline with {args.controlnet} ...", file=sys.stderr)
@@ -701,6 +744,47 @@ def main():
                     refs_for_boogu.extend(inline_ref_images)
                 if refs_for_boogu:
                     pipe_kwargs["input_images"] = [refs_for_boogu]
+                result = pipe(**pipe_kwargs)
+                image = result.images[0]
+                write_image(image, outpath, prompt, args.seed)
+                if args.cumulative:
+                    cum_outs.append(image)
+                elapsed = time.time() - t_start
+                print(f"{elapsed:.1f}s -> {outpath}", file=sys.stderr)
+                continue
+
+            if args.model == "qwen-image-2.1":
+                qwen_steps = args.steps if args.steps != 4 else QWEN21_DEFAULT_STEPS
+                generator = torch.Generator(device=args.device).manual_seed(args.seed)
+                pipe_kwargs = dict(
+                    prompt=prompt,
+                    height=h,
+                    width=w,
+                    num_inference_steps=qwen_steps,
+                    generator=generator,
+                    output_type="pil",
+                )
+                refs_for_qwen = []
+                if input_image is not None:
+                    refs_for_qwen.append(input_image)
+                if args.ref_file:
+                    ref_file_content, ref_file_images = _read_ref_file(
+                        args.ref_file, ref_file_content, ref_file_images
+                    )
+                    refs_for_qwen.extend(ref_file_images)
+                if ref_slots:
+                    slot_idx = i % len(ref_slots)
+                    inner_idx = i // len(ref_slots) % len(ref_slots[slot_idx])
+                    refs_for_qwen.append(ref_images[slot_idx][inner_idx])
+                if args.cumulative:
+                    refs_for_qwen.extend(cum_outs)
+                if inline_ref_images:
+                    refs_for_qwen.extend(inline_ref_images)
+                if len(refs_for_qwen) > QWEN21_MAX_CONDITION_IMAGES:
+                    print(f"Qwen-Image-2.1 supports up to {QWEN21_MAX_CONDITION_IMAGES} reference images; got {len(refs_for_qwen)}, truncating", file=sys.stderr)
+                    refs_for_qwen = refs_for_qwen[:QWEN21_MAX_CONDITION_IMAGES]
+                if refs_for_qwen:
+                    pipe_kwargs["image"] = refs_for_qwen[0] if len(refs_for_qwen) == 1 else refs_for_qwen
                 result = pipe(**pipe_kwargs)
                 image = result.images[0]
                 write_image(image, outpath, prompt, args.seed)

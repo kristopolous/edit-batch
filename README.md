@@ -1,8 +1,8 @@
 # edit-batch
 
-Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), or [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit).
+Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1).
 
-Run the same prompt across many images with dynamic prompting, static and dynamic reference images, support for multiple generations and step count modification along with multiple text encoders and loras. Optionally use HiDream-O1-Image or Boogu-Image-0.1-Edit as the backend model.
+Run the same prompt across many images with dynamic prompting, static and dynamic reference images, support for multiple generations and step count modification along with multiple text encoders and loras. Optionally use HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 as the backend model.
 
 Repos, GGUFs, and other dependencies are cached under `~/.cache/flux-batch/`.
 
@@ -109,7 +109,7 @@ You'll need the HiDream repo dependencies installed (`pip install -r /path/to/Hi
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `flux` | Model to use: `flux`, `hidream`, or `boogu` |
+| `--model` | `flux` | Model to use: `flux`, `hidream`, `boogu`, or `qwen-image-2.1` |
 | `--model-type` | `full` | `full` (25 steps, guidance 5.0) or `dev` (28 steps, guidance 0.0) |
 | `--guidance-scale` | * | Guidance scale (5.0 full, 0.0 dev) |
 | `--seed` | `42` | Random seed for reproducibility |
@@ -142,6 +142,33 @@ edit-batch --model boogu -o out/ -p prompt.txt --width 1024 --height 1024
 | `--image-guidance-scale` | `1.0` | Image guidance scale |
 
 **Requirements:** `bitsandbytes` (installed automatically) for 4-bit MLLM quantization. ~12 GiB VRAM needed for 1024² generation.
+
+### Qwen-Image-2.1 Mode
+
+Use `--model qwen-image-2.1` to run [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), a unified 7B text-to-image generation and image editing model with native RGBA transparency and up to 10 reference images for multi-subject composition.
+
+Requires a diffusers release with `QwenImage21Pipeline` (upstream PR [#14804](https://github.com/huggingface/diffusers/pull/14804), not yet in pip releases) and `transformers>=5.17`:
+
+```bash
+pip install -U "git+https://github.com/huggingface/diffusers" "transformers>=5.17" accelerate
+```
+
+```bash
+# Image editing (input image is the edit target)
+edit-batch --model qwen-image-2.1 -i "*.jpg" -o out/ -p prompt.txt
+
+# Text-to-image
+edit-batch --model qwen-image-2.1 -o out/ -p prompt.txt --width 1024 --height 1024
+
+# Multi-reference composition: input + -r/-rf refs + inline ref: all become condition images
+edit-batch --model qwen-image-2.1 -i "photo.jpg" -r "refs/*.jpg" -o out/ -p prompt.txt
+```
+
+**Qwen notes:**
+- Defaults to **40 inference steps** (`-s` overrides); the model is meant to be sampled without CFG guidance (`true_cfg_scale=1.0`).
+- The input image and every reference (from `-r`/`-rf`, inline `ref:`, or `--cumulative` outputs) are passed together as condition images to the pipeline's `image` argument (capped at 10).
+- Use the transparency prompt format for RGBA output: `This is an RGBA image with transparency. <desc>. The image has alpha channel and the background is transparent.`
+- ~16 GiB VRAM needed at 2048² native resolution; `enable_model_cpu_offload()` is used by default like the other backends.
 
 ### Skeleton ControlNet Mode
 
@@ -204,7 +231,7 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
 | `--shuf` | false | Shuffle input file order randomly |
 | `-nc` | false | No Clobber — skip existing outputs |
-| `--model` | `flux` | Model backend: `flux`, `hidream`, or `boogu` |
+| `--model` | `flux` | Model backend: `flux`, `hidream`, `boogu`, or `qwen-image-2.1` |
 
 | `--model-type` | `full` | HiDream variant: `full` (25 steps) or `dev` (28 steps) |
 | `--guidance-scale` | * | HiDream guidance scale (5.0 full, 0.0 dev) |
