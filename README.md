@@ -6,6 +6,23 @@ Run the same prompt across many images with dynamic prompting, static and dynami
 
 Repos, GGUFs, and other dependencies are cached under `~/.cache/flux-batch/`.
 
+### Installation
+
+```bash
+# Base dependencies for all backends (flux, hidream, boogu)
+uv pip install -r pyproject.toml          # or: pip install -r requirements.txt
+
+# Qwen-Image-2.1 (--model qwen-image-2.1) additionally requires a diffusers build with
+# QwenImage21Pipeline (upstream PR #14804, not yet in pip releases) plus transformers>=5.17:
+uv pip install "git+https://github.com/huggingface/diffusers" "transformers>=5.17"
+```
+
+**`flash-attn` is optional** and excluded from the base install. It builds from source (no prebuilt wheel covers this platform) and needs a CUDA toolkit (`nvcc`); it is also missing torch from its own build env, so the isolated build fails without one. No backend imports or requires it — attention falls back automatically — so only install it on a machine with the CUDA toolkit where you want the flash kernels:
+
+```bash
+uv pip install -e ".[attn]"
+```
+
 - Output directory (`-o`) is created automatically if it doesn't exist.
 - The prompt file is reread at each image, so you can modify it mid-batch.
 - The ref file (`-rf`) is also reread on each iteration — changes are detected by content comparison, and images are only reloaded when the file actually changes.

@@ -39,8 +39,11 @@ dependencies = [
     "einops",
     "tqdm",
     "scipy",
-    "flash-attn",
 ]
+
+[project.optional-dependencies]
+# Requires a CUDA toolkit (nvcc) to build; no prebuilt wheel exists for this platform.
+attn = ["flash-attn"]
 
 [project.urls]
 Homepage = "https://github.com/kristopolous/flux-batch"

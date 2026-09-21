@@ -9,4 +9,4 @@ accelerate
 mediapipe
 opencv-python
 peft
-flash-attn
+# Optional: "flash-attn" (needs nvcc to build); omitted by default — not required by any backend.
