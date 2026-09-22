@@ -1,6 +1,6 @@
 [project]
 name = "edit-batch"
-version = "0.1.0"
+version = "0.1.1"
 description = "Batch image processing with FLUX.2 klein Q4 GGUF, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1"
 readme = "README.md"
 license = { text = "MIT" }
@@ -58,4 +58,5 @@ build-backend = "setuptools.build_meta"
 fallback_version = "0.1.0"
 
 [tool.setuptools]
-scripts = ["edit-batch"]
+script-files = ["edit-batch"]
+packages = []
