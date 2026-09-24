@@ -85,7 +85,7 @@ def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, s
     import subprocess
     cmd = [
         str(sd_cli),
-        "--log-level", "info",
+        "--log-level", "warn",
         "--diffusion-model", str(dit),
         "--vae", str(vae),
         "--llm", str(llm),
@@ -103,7 +103,17 @@ def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, s
         cmd += ["-r", str(r)]
     if output_resolution != QWEN21_DEFAULT_MAX_SIDE:
         cmd += ["--ref-image-args", f"vae_input_max_pixels={int(output_resolution) ** 2}"]
-    subprocess.run(cmd, check=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    for line in proc.stderr:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        if ("[INFO" in line) or (line.strip().startswith("|") and "[INFO" not in line and "[WARN" not in line and "[ERROR" not in line):
+            continue
+        print(line, file=sys.stderr)
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 def extract_refs(prompt):
     """Extract ref:<path> tokens from a prompt string.
@@ -834,32 +844,44 @@ def main():
                 qwen_steps = args.steps if args.steps != 4 else QWEN21_DEFAULT_STEPS
                 qwen_pool = []
                 if ref_images:
-                    for _slot_imgs in ref_images:
-                        qwen_pool.extend(_slot_imgs)
-                qwen_pool.extend(inline_ref_images)
+                    for _sidx, _slot_imgs in enumerate(ref_images):
+                        _slot_src = ref_slots[_sidx] if _sidx < len(ref_slots) else []
+                        for _k, _img in enumerate(_slot_imgs):
+                            _src = _slot_src[_k] if _k < len(_slot_src) else f"slot{_sidx}#{_k}"
+                            qwen_pool.append((str(_src), _img))
+                for _rp, _img in zip(inline_ref_paths, inline_ref_images):
+                    qwen_pool.append((f"inline:{_rp}", _img))
                 if args.ref_file:
                     ref_file_content, ref_file_images = _read_ref_file(
                         args.ref_file, ref_file_content, ref_file_images
                     )
-                    qwen_pool.extend(ref_file_images)
+                    qwen_pool.extend((f"ref-file#{_j}", _img) for _j, _img in enumerate(ref_file_images))
                 n_pool = len(qwen_pool)
                 refs_for_qwen = []
+                used_labels = []
                 if input_image is not None:
                     refs_for_qwen.append(input_image)
+                    used_labels.append(inpath if inpath else "no-input")
                 if n_pool:
                     if args.qwen_refs_per_image:
                         _start = i % n_pool
-                        refs_for_qwen.extend(
-                            qwen_pool[(_start + _k) % n_pool]
-                            for _k in range(min(args.qwen_refs_per_image, n_pool))
-                        )
+                        for _k in range(min(args.qwen_refs_per_image, n_pool)):
+                            _pl = qwen_pool[(_start + _k) % n_pool]
+                            refs_for_qwen.append(_pl[1])
+                            used_labels.append(_pl[0])
                     elif input_image is None:
-                        refs_for_qwen.append(qwen_pool[i % n_pool])
+                        _pl = qwen_pool[i % n_pool]
+                        refs_for_qwen.append(_pl[1])
+                        used_labels.append(_pl[0])
                 if args.cumulative:
-                    refs_for_qwen.extend(cum_outs)
+                    for _j, _img in enumerate(cum_outs):
+                        refs_for_qwen.append(_img)
+                        used_labels.append(f"cum#{_j}")
                 if len(refs_for_qwen) > QWEN21_MAX_CONDITION_IMAGES:
                     print(f"Qwen-Image-2.1 supports up to {QWEN21_MAX_CONDITION_IMAGES} reference images; got {len(refs_for_qwen)}, truncating", file=sys.stderr)
                     refs_for_qwen = refs_for_qwen[:QWEN21_MAX_CONDITION_IMAGES]
+                    used_labels = used_labels[:len(refs_for_qwen)]
+                print(f"qwen refs[{i}]: {' + '.join(used_labels) if used_labels else '(none)'}", file=sys.stderr)
                 if qwen_sd:
                     if refs_for_qwen and max(w, h) > QWEN21_SD_REF_MAX_SIDE:
                         print(f"Qwen-Image-2.1 sd.cpp: {len(refs_for_qwen)} refs at {w}x{h}. The FP32 ref prefix cache cannot fit in 24 GB VRAM above {QWEN21_SD_REF_MAX_SIDE}; sd-cli drops the cache and recomputes per step (~30 min/image). Measured fast: t2i 1024², or refs <= {QWEN21_SD_REF_MAX_SIDE}.", file=sys.stderr)
