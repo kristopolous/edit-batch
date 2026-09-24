@@ -34,7 +34,7 @@ BOOGU_GGUF_URL = "https://huggingface.co/realrebelai/Boogu-Image-Edit-Turbo_GGUF
 
 QWEN21_MODEL = "Qwen/Qwen-Image-2.1"
 QWEN21_MIN_TRANSFORMERS = (5, 17)  # QwenImage21Pipeline needs transformers>=5.17
-QWEN21_DEFAULT_STEPS = 40
+QWEN21_DEFAULT_STEPS = 20
 QWEN21_MAX_CONDITION_IMAGES = 10
 QWEN21_DEFAULT_MAX_SIDE = 1024  # memory-safe default; ~15B params total (7B DiT + 8B text encoder + VAE)
 QWEN21_SD_DIR = Path.home() / ".cache" / "flux-batch" / "qwen-2.1-sd"  # sd.cpp qwen companion files
