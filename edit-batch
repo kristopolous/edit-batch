@@ -13,6 +13,7 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw
 from PIL.PngImagePlugin import PngInfo
+import tempfile
 
 GGUF_URL = "https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF/blob/main/flux-2-klein-9b-Q4_K_M.gguf"
 BASE_MODEL = "black-forest-labs/FLUX.2-klein-9B"
@@ -36,6 +37,14 @@ QWEN21_MIN_TRANSFORMERS = (5, 17)  # QwenImage21Pipeline needs transformers>=5.1
 QWEN21_DEFAULT_STEPS = 40
 QWEN21_MAX_CONDITION_IMAGES = 10
 QWEN21_DEFAULT_MAX_SIDE = 1024  # memory-safe default; ~15B params total (7B DiT + 8B text encoder + VAE)
+QWEN21_SD_DIR = Path.home() / ".cache" / "flux-batch" / "qwen-2.1-sd"  # sd.cpp qwen companion files
+QWEN21_SD_CLI = QWEN21_SD_DIR.parent / "sd-cpp" / "sd-cli"
+QWEN21_SD_LLM = QWEN21_SD_DIR / "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+QWEN21_SD_MMPROJ = QWEN21_SD_DIR / "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+QWEN21_SD_VAE = QWEN21_SD_DIR / "qwen_image_2.1_vae_bf16.safetensors"
+QWEN21_UC_GGUF = Path("qwen-image-2.1-UC-Q4_0.gguf")  # uncensored DiT; overridable via --qwen-gguf
+QWEN21_SD_SAMPLER = "euler"
+QWEN21_SD_CFG = 6.0
 
 LORA_CACHE_DIR = Path.home() / ".cache" / "flux-batch" / "loras"
 LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,6 +72,36 @@ def download_file(url, dest):
     result = subprocess.run(['curl', '-L', '-s', '-o', str(dest), url], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to download {url}: {result.stderr}")
+
+def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, steps, cfg, seed, ref_paths, output_resolution=QWEN21_DEFAULT_MAX_SIDE):
+    """Run Qwen-Image-2.1 through stable-diffusion.cpp (sd-cli) with native GGUF quantization.
+
+    DiT stays quantized (Q4 ~4.6 GB) in VRAM during sampling; the text/vision encoder is
+    offloaded to CPU RAM (--offload-to-cpu), keeping the whole model comfortably in ~24 GB VRAM.
+    """
+    import subprocess
+    cmd = [
+        str(sd_cli),
+        "--log-level", "info",
+        "--diffusion-model", str(dit),
+        "--vae", str(vae),
+        "--llm", str(llm),
+        "--llm_vision", str(mmproj),
+        "-p", prompt,
+        "-o", str(outpath),
+        "-W", str(width),
+        "-H", str(height),
+        "--steps", str(steps),
+        "--cfg-scale", str(cfg),
+        "--sampling-method", QWEN21_SD_SAMPLER,
+        "-s", str(seed),
+        "--offload-to-cpu",
+    ]
+    for r in ref_paths:
+        cmd += ["-r", str(r)]
+    if output_resolution != QWEN21_DEFAULT_MAX_SIDE:
+        cmd += ["--ref-image-args", f"vae_input_max_pixels={int(output_resolution) ** 2}"]
+    subprocess.run(cmd, check=True)
 
 def extract_refs(prompt):
     """Extract ref:<path> tokens from a prompt string.
@@ -188,6 +227,10 @@ def main():
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {ver}")
     parser.add_argument("-w", "--width", type=int, help="Explicit output width (enforced)")
     parser.add_argument("--output-resolution", type=int, default=QWEN21_DEFAULT_MAX_SIDE, help="Qwen-Image-2.1 only: target side length every condition/reference image is resized to before encoding (default: 1024). Each ref is inflated to this regardless of its source size; lower it (e.g. 512) to fit many refs in ~24 GB VRAM")
+    parser.add_argument("--qwen-backend", default="auto", choices=["auto", "sd", "diffusers"], help="Qwen-Image-2.1 engine: sd (stable-diffusion.cpp; runs the uncensored Q4 GGUF, DiT ~4.6 GB in VRAM), diffusers (base HF weights), or auto (sd when -nsfw and the Q4 GGUF is present, else diffusers) (default: auto)")
+    parser.add_argument("--qwen-gguf", help=f"Qwen-Image-2.1 uncensored diffusion GGUF for --qwen-backend sd (default: {QWEN21_UC_GGUF})")
+    parser.add_argument("--qwen-sd-dir", help=f"sd.cpp qwen companion directory containing Qwen3VL-8B-Instruct-Q4_K_M.gguf, mmproj-Qwen3VL-8B-Instruct-F16.gguf and qwen_image_2.1_vae_bf16.safetensors (default: {QWEN21_SD_DIR})")
+    parser.add_argument("--qwen-sd-cfg", type=float, default=QWEN21_SD_CFG, help="CFG scale for --qwen-backend sd (default: 6.0)")
     parser.add_argument('--offset', type=int, default=0, help='Start reading prompt file from this line (default: 0)')
     parser.add_argument('-nc', '--no-clobber', action='store_true', dest='nc', help='No Clobber')
 
@@ -247,6 +290,26 @@ def main():
         total_slots = len(ref_slots)
         total_refs = sum(len(s) for s in ref_slots)
         print(f"Loaded {total_refs} reference image(s) across {total_slots} slot(s)", file=sys.stderr)
+
+    if args.model == "qwen-image-2.1":
+        qwen_sd_dir = Path(args.qwen_sd_dir) if args.qwen_sd_dir else QWEN21_SD_DIR
+        qwen_gguf = Path(args.qwen_gguf) if args.qwen_gguf else QWEN21_UC_GGUF
+        qwen_sd = False
+        if args.qwen_backend == "sd":
+            qwen_sd = True
+        elif args.qwen_backend == "auto":
+            qwen_sd = bool(args.nsfw) and qwen_gguf.exists()
+            if args.nsfw and not qwen_sd:
+                print("Warning: -nsfw wants the uncensored Q4 GGUF but it is missing; falling back to diffusers base weights. Drop it at ./qwen-image-2.1-UC-Q4_0.gguf or pass --qwen-gguf (or force --qwen-backend diffusers)", file=sys.stderr)
+        if qwen_sd:
+            _missing = [label for label, path in (("sd-cli", QWEN21_SD_CLI), ("text encoder", QWEN21_SD_LLM), ("vision mmproj", QWEN21_SD_MMPROJ), ("VAE", QWEN21_SD_VAE)) if not path.exists()]
+            if not qwen_gguf.exists():
+                _missing.append(f"Q4 GGUF ({qwen_gguf})")
+            if _missing:
+                print(f"Error: --qwen-backend sd is missing: {', '.join(_missing)}", file=sys.stderr)
+                print("       Install the sd.cpp qwen files (see README) or use --qwen-backend diffusers for the base model.", file=sys.stderr)
+                sys.exit(1)
+            print(f"Qwen-Image-2.1 sd.cpp backend (Q4 GGUF uncensored): {qwen_gguf}", file=sys.stderr)
 
     if args.model == "hidream":
         hidream_src = LORA_CACHE_DIR.parent / "hidream" / "HiDream-O1-Image"  # cached at ~/.cache/flux-batch/hidream/HiDream-O1-Image
@@ -462,28 +525,32 @@ def main():
                 print("DMD turbo: overriding text_guidance_scale to 1.0 (use --text-guidance-scale to override)", file=sys.stderr)
                 args.text_guidance_scale = 1.0
     elif args.model == "qwen-image-2.1":
-        try:
-            from diffusers import QwenImage21Pipeline
-        except ImportError:
-            print("Error: --model qwen-image-2.1 requires a diffusers release with QwenImage21Pipeline", file=sys.stderr)
-            print("       (merged upstream in PR #14804; not yet in pip releases).", file=sys.stderr)
-            print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers'", file=sys.stderr)
-            sys.exit(1)
-        import transformers as _qtf
-        try:
-            _qver = tuple(int(p) for p in _qtf.__version__.split(".")[:2])
-        except Exception:
-            _qver = (0, 0)
-        if _qver < QWEN21_MIN_TRANSFORMERS:
-            print(f"Error: --model qwen-image-2.1 requires transformers>={'.'.join(map(str, QWEN21_MIN_TRANSFORMERS))} (found {_qtf.__version__}).", file=sys.stderr)
-            print("       Install: pip install -U 'transformers>=5.17'", file=sys.stderr)
-            sys.exit(1)
-        print(f"Loading {QWEN21_MODEL} ...", file=sys.stderr)
-        t0 = time.time()
-        pipe = QwenImage21Pipeline.from_pretrained(QWEN21_MODEL, torch_dtype=torch.bfloat16)
-        pipe.enable_model_cpu_offload()
-        t1 = time.time()
-        print(f"Qwen-Image-2.1 model ready in {t1 - t0:.1f}s", file=sys.stderr)
+        if qwen_sd:
+            pipe = None
+            print("sd.cpp backend ready (no diffusers weights loaded)", file=sys.stderr)
+        else:
+            try:
+                from diffusers import QwenImage21Pipeline
+            except ImportError:
+                print("Error: --model qwen-image-2.1 requires a diffusers release with QwenImage21Pipeline", file=sys.stderr)
+                print("       (merged upstream in PR #14804; not yet in pip releases).", file=sys.stderr)
+                print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers'", file=sys.stderr)
+                sys.exit(1)
+            import transformers as _qtf
+            try:
+                _qver = tuple(int(p) for p in _qtf.__version__.split(".")[:2])
+            except Exception:
+                _qver = (0, 0)
+            if _qver < QWEN21_MIN_TRANSFORMERS:
+                print(f"Error: --model qwen-image-2.1 requires transformers>={'.'.join(map(str, QWEN21_MIN_TRANSFORMERS))} (found {_qtf.__version__}).", file=sys.stderr)
+                print("       Install: pip install -U 'transformers>=5.17'", file=sys.stderr)
+                sys.exit(1)
+            print(f"Loading {QWEN21_MODEL} ...", file=sys.stderr)
+            t0 = time.time()
+            pipe = QwenImage21Pipeline.from_pretrained(QWEN21_MODEL, torch_dtype=torch.bfloat16)
+            pipe.enable_model_cpu_offload()
+            t1 = time.time()
+            print(f"Qwen-Image-2.1 model ready in {t1 - t0:.1f}s", file=sys.stderr)
     elif args.skeleton:
         from transformers import AutoModel, AutoTokenizer
         print(f"Loading ControlNet pipeline with {args.controlnet} ...", file=sys.stderr)
@@ -762,15 +829,6 @@ def main():
                         w, h = int(w * _clamp), int(h * _clamp)
                         print(f"Qwen-Image-2.1: clamped output to {w}x{h} (max side {QWEN21_DEFAULT_MAX_SIDE}; use -w/-h or --max-width/--max-height to raise)", file=sys.stderr)
                 qwen_steps = args.steps if args.steps != 4 else QWEN21_DEFAULT_STEPS
-                generator = torch.Generator(device=args.device).manual_seed(args.seed)
-                pipe_kwargs = dict(
-                    prompt=prompt,
-                    height=h,
-                    width=w,
-                    num_inference_steps=qwen_steps,
-                    generator=generator,
-                    output_type="pil",
-                )
                 refs_for_qwen = []
                 if input_image is not None:
                     refs_for_qwen.append(input_image)
@@ -790,13 +848,56 @@ def main():
                 if len(refs_for_qwen) > QWEN21_MAX_CONDITION_IMAGES:
                     print(f"Qwen-Image-2.1 supports up to {QWEN21_MAX_CONDITION_IMAGES} reference images; got {len(refs_for_qwen)}, truncating", file=sys.stderr)
                     refs_for_qwen = refs_for_qwen[:QWEN21_MAX_CONDITION_IMAGES]
-                if refs_for_qwen:
-                    pipe_kwargs["image"] = refs_for_qwen[0] if len(refs_for_qwen) == 1 else refs_for_qwen
-                if refs_for_qwen or args.output_resolution != QWEN21_DEFAULT_MAX_SIDE:
-                    pipe_kwargs["output_resolution"] = args.output_resolution
-                result = pipe(**pipe_kwargs)
-                image = result.images[0]
-                write_image(image, outpath, prompt, args.seed)
+                if qwen_sd:
+                    _tmpdir = Path(tempfile.mkdtemp(prefix="flux-batch-qwen-"))
+                    ref_paths = []
+                    if input_image is not None:
+                        _p = _tmpdir / "input.png"
+                        input_image.save(_p)
+                        ref_paths.append(_p)
+                    if args.ref_file:
+                        for _j, _img in enumerate(ref_file_images):
+                            _p = _tmpdir / f"reffile{_j}.png"
+                            _img.save(_p)
+                            ref_paths.append(_p)
+                    if ref_slots:
+                        ref_paths.append(Path(ref_slots[slot_idx][inner_idx]))
+                    if args.cumulative:
+                        for _j, _img in enumerate(cum_outs):
+                            _p = _tmpdir / f"cum{_j}.png"
+                            _img.save(_p)
+                            ref_paths.append(_p)
+                    if inline_ref_images:
+                        for _j, _img in enumerate(inline_ref_images):
+                            _p = _tmpdir / f"inline{_j}.png"
+                            _img.save(_p)
+                            ref_paths.append(_p)
+                    ref_paths = ref_paths[:len(refs_for_qwen)]
+                    _cfg = args.guidance_scale if args.guidance_scale is not None else args.qwen_sd_cfg
+                    run_sd_qwen(
+                        QWEN21_SD_CLI, qwen_gguf, QWEN21_SD_LLM, QWEN21_SD_MMPROJ, QWEN21_SD_VAE,
+                        prompt, outpath, w, h, qwen_steps, _cfg, args.seed,
+                        ref_paths, args.output_resolution,
+                    )
+                    image = Image.open(outpath)
+                    write_image(image, outpath, prompt, args.seed)
+                else:
+                    generator = torch.Generator(device=args.device).manual_seed(args.seed)
+                    pipe_kwargs = dict(
+                        prompt=prompt,
+                        height=h,
+                        width=w,
+                        num_inference_steps=qwen_steps,
+                        generator=generator,
+                        output_type="pil",
+                    )
+                    if refs_for_qwen:
+                        pipe_kwargs["image"] = refs_for_qwen[0] if len(refs_for_qwen) == 1 else refs_for_qwen
+                    if refs_for_qwen or args.output_resolution != QWEN21_DEFAULT_MAX_SIDE:
+                        pipe_kwargs["output_resolution"] = args.output_resolution
+                    result = pipe(**pipe_kwargs)
+                    image = result.images[0]
+                    write_image(image, outpath, prompt, args.seed)
                 if args.cumulative:
                     cum_outs.append(image)
                 elapsed = time.time() - t_start

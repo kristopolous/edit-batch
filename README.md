@@ -170,6 +170,8 @@ Requires a diffusers release with `QwenImage21Pipeline` (upstream PR [#14804](ht
 pip install -U "git+https://github.com/huggingface/diffusers" "transformers>=5.17" accelerate
 ```
 
+For the **uncensored Q4 path** (`-nsfw`) the script instead shells out to [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`sd-cli`), the engine the Qwen-Image-2.1 GGUF ecosystem uses — no diffusers load required. See "Uncensored Q4 / sd.cpp backend" below.
+
 ```bash
 # Image editing (input image is the edit target)
 edit-batch --model qwen-image-2.1 -i "*.jpg" -o out/ -p prompt.txt
@@ -186,6 +188,38 @@ edit-batch --model qwen-image-2.1 -i "photo.jpg" -r "refs/*.jpg" -o out/ -p prom
 - The input image and every reference (from `-r`/`-rf`, inline `ref:`, or `--cumulative` outputs) are passed together as condition images to the pipeline's `image` argument (capped at 10).
 - Use the transparency prompt format for RGBA output: `This is an RGBA image with transparency. <desc>. The image has alpha channel and the background is transparent.`
 - **Memory:** the model is ~16B params total (7.1B DiT + 8.8B Qwen3-VL text encoder + 0.34B fp32 VAE ≈ 33 GB in bf16/fp32), so it only fits a 24 GB card because edit-batch uses `enable_model_cpu_offload()` — one component resident at a time. **Do not** switch to `.to("cuda")`; the Quick Start snippet on the model page does that and OOMs instantly at any resolution (measured). With offload on a 24 GB 4090: 1024² t2i peaks ~16.4 GiB, a 128 px edit of a 3024×4032 photo ~19.1 GiB. **Reference image size is irrelevant**: the pipeline inflates every condition image to ~`output_resolution`² (1024² default) before encoding, so a 180×180 thumbnail costs the same VRAM as a full-size photo — the memory scales with ref *count*, not ref size. Measured limit at the default: 2 refs fine (~19.1 GiB), 4+ refs OOM. Lower `--output-resolution` (e.g. `--output-resolution 512`) to shrink ref encoding cost without changing your requested output size: 8 refs at 512 fit in ~19.1 GiB and all 10 in ~20.4 GiB. The script clamps qwen output to a max side of 1024 by default — native 2K (2048², ~16k latent tokens) is the true 24 GB breaker; raise the cap with `-w`/`-h` or `--max-width`/`--max-height`.
+
+#### Uncensored Q4 / sd.cpp backend (`-nsfw`)
+
+`-m qwen-image-2.1 -nsfw` runs the **uncensored** [Qwen-Image-2.1 GGUF](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF) through `sd-cli` instead of the diffusers pipeline, matching how the 400k+ GGUF downloads are actually run on consumer cards: the quantized DiT stays in VRAM during sampling (~4.6 GB for Q4) while the text/vision encoder is offloaded to CPU RAM (`--offload-to-cpu`).
+
+Setup (one-time): install the `stable-diffusion.cpp` **Vulkan** Linux build (sd.cpp ships no Linux CUDA prebuilt — Linux releases are CPU / Vulkan / ROCm only; CUDA requires a source build with `-DSD_CUDA=ON`) and the companion files next to the model:
+
+```bash
+# 1. sd-cli binary -> ~/.cache/flux-batch/sd-cpp/
+#    (sd-master-...-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip from
+#     https://github.com/leejet/stable-diffusion.cpp/releases;
+#     the plain ...-x86_64.zip is the CPU-only build)
+#    Needs a Vulkan-capable driver (nvidia_icd.json + libvulkan.so.1); the
+#    4090 then shows up as "Vulkan0" and all compute runs on the GPU.
+
+# 2. companions -> ~/.cache/flux-batch/qwen-2.1-sd/
+#    Qwen3VL-8B-Instruct-Q4_K_M.gguf            (text encoder, Q4_K_M)
+#    mmproj-Qwen3VL-8B-Instruct-F16.gguf        (vision encoder, required for refs/editing)
+#    qwen_image_2.1_vae_bf16.safetensors        (VAE)
+
+# 3. the uncensored DiT -> repo root (or point --qwen-gguf at it)
+#    qwen-image-2.1-UC-Q4_0.gguf                (Q4_0; Q4_K_M recommended)
+```
+
+Then:
+
+```bash
+edit-batch -m qwen-image-2.1 -nsfw -p "prompt.txt" -o out/ --width 1024 --height 1024  # t2i
+edit-batch -m qwen-image-2.1 -nsfw -i "photo.jpg" -r "refs/*.jpg" -o out/ -p prompt.txt  # edit + refs
+```
+
+`--qwen-backend` forces the engine: `auto` (default; sd when `-nsfw` and `--qwen-gguf` exists, else diffusers), `sd`, or `diffusers`. `--qwen-gguf` points at the DiT GGUF; `--qwen-sd-dir` overrides the companion directory; `--qwen-sd-cfg` and `--guidance-scale` set CFG (default 6.0). Ref handling matches diffusers mode (input + `-r`/`-rf`/inline/`--cumulative`, capped at 10, order-preserved) and `--output-resolution` maps to sd-cli's `vae_input_max_pixels` (i.e. `resolution²`) to control ref encode cost. All `-r` refs are passed as filesystem paths; input/inline/cumulative refs are staged as temp PNGs.
 
 ### Skeleton ControlNet Mode
 
@@ -245,6 +279,10 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--max-height` | — | Maximum height constraint; overrides `--scale`, maintains aspect ratio |
 | `--ratio` | — | Target aspect ratio (e.g. `16:9`, `4:3`); applied after scale/max constraints, then reclamped to max bounds |
 | `--output-resolution` | `1024` | Qwen-Image-2.1 only: target side length every condition/reference image is resized to before encoding; lower it (e.g. 512) to fit many refs in 24 GB VRAM |
+| `--qwen-backend` | `auto` | Qwen-Image-2.1 engine: `auto` (sd when `-nsfw` and the Q4 GGUF exists, else diffusers), `sd`, or `diffusers` |
+| `--qwen-gguf` | `./qwen-image-2.1-UC-Q4_0.gguf` | Uncensored Qwen-Image-2.1 diffusion GGUF for the sd backend |
+| `--qwen-sd-dir` | `~/.cache/flux-batch/qwen-2.1-sd` | Directory with Qwen3VL text encoder, mmproj, and VAE for the sd backend |
+| `--qwen-sd-cfg` | `6.0` | CFG scale for the sd backend (overridden by `--guidance-scale`) |
 | `--offset` | `0` | Start reading prompt file from this line (default: 0) |
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
 | `--shuf` | false | Shuffle input file order randomly |
