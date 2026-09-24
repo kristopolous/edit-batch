@@ -76,8 +76,10 @@ def download_file(url, dest):
 def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, steps, cfg, seed, ref_paths, output_resolution=QWEN21_DEFAULT_MAX_SIDE):
     """Run Qwen-Image-2.1 through stable-diffusion.cpp (sd-cli) with native GGUF quantization.
 
-    DiT stays quantized (Q4 ~4.6 GB) in VRAM during sampling; the text/vision encoder is
-    offloaded to CPU RAM (--offload-to-cpu), keeping the whole model comfortably in ~24 GB VRAM.
+    Everything runs on the GPU (Vulkan): quantized DiT (Q4 ~4.6 GB) + Qwen3-VL encoder
+    (~4.3 GB) + VAE fit in ~24 GB VRAM, so no --offload-to-cpu — that flag forces weights to
+    RAM and, at 1024²+refs, the model manager CPU-falls back (prefix-cache disabled → encoder
+    recomputed per step, ~30 min/image). sd.cpp auto-streams weights when memory is tight.
     """
     import subprocess
     cmd = [
@@ -95,7 +97,6 @@ def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, s
         "--cfg-scale", str(cfg),
         "--sampling-method", QWEN21_SD_SAMPLER,
         "-s", str(seed),
-        "--offload-to-cpu",
     ]
     for r in ref_paths:
         cmd += ["-r", str(r)]

@@ -191,7 +191,7 @@ edit-batch --model qwen-image-2.1 -i "photo.jpg" -r "refs/*.jpg" -o out/ -p prom
 
 #### Uncensored Q4 / sd.cpp backend (`-nsfw`)
 
-`-m qwen-image-2.1 -nsfw` runs the **uncensored** [Qwen-Image-2.1 GGUF](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF) through `sd-cli` instead of the diffusers pipeline, matching how the 400k+ GGUF downloads are actually run on consumer cards: the quantized DiT stays in VRAM during sampling (~4.6 GB for Q4) while the text/vision encoder is offloaded to CPU RAM (`--offload-to-cpu`).
+`-m qwen-image-2.1 -nsfw` runs the **uncensored** [Qwen-Image-2.1 GGUF](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF) through `sd-cli` (Vulkan backend) instead of the diffusers pipeline, matching how the 400k+ GGUF downloads are actually run on consumer cards. Everything runs on the GPU: quantized DiT (Q4 ~4.6 GB), the Qwen3-VL encoder (~4.3 GB) and the VAE all fit in ~24 GB VRAM. Do **not** pass `--offload-to-cpu` here — it forces weights to RAM and at 1024² + refs the model manager CPU-falls back (prefix caching disabled, encoder recomputed every step, ~30 min/image); sd.cpp streams weights automatically when VRAM runs out.
 
 Setup (one-time): install the `stable-diffusion.cpp` **Vulkan** Linux build (sd.cpp ships no Linux CUDA prebuilt — Linux releases are CPU / Vulkan / ROCm only; CUDA requires a source build with `-DSD_CUDA=ON`) and the companion files next to the model:
 
