@@ -35,6 +35,7 @@ BOOGU_GGUF_URL = "https://huggingface.co/realrebelai/Boogu-Image-Edit-Turbo_GGUF
 QWEN21_MODEL = "Qwen/Qwen-Image-2.1"
 QWEN21_MIN_TRANSFORMERS = (5, 17)  # QwenImage21Pipeline needs transformers>=5.17
 QWEN21_DEFAULT_STEPS = 20
+QWEN21_SD_REF_MAX_SIDE = 768  # measured: FP32 ref prefix cache fits 24 GB VRAM only up to this with refs
 QWEN21_MAX_CONDITION_IMAGES = 10
 QWEN21_DEFAULT_MAX_SIDE = 1024  # memory-safe default; ~15B params total (7B DiT + 8B text encoder + VAE)
 QWEN21_SD_DIR = Path.home() / ".cache" / "flux-batch" / "qwen-2.1-sd"  # sd.cpp qwen companion files
@@ -232,6 +233,7 @@ def main():
     parser.add_argument("--qwen-gguf", help=f"Qwen-Image-2.1 uncensored diffusion GGUF for --qwen-backend sd (default: {QWEN21_UC_GGUF})")
     parser.add_argument("--qwen-sd-dir", help=f"sd.cpp qwen companion directory containing Qwen3VL-8B-Instruct-Q4_K_M.gguf, mmproj-Qwen3VL-8B-Instruct-F16.gguf and qwen_image_2.1_vae_bf16.safetensors (default: {QWEN21_SD_DIR})")
     parser.add_argument("--qwen-sd-cfg", type=float, default=QWEN21_SD_CFG, help="CFG scale for --qwen-backend sd (default: 6.0)")
+    parser.add_argument("--qwen-refs-per-image", type=int, default=1, help="Qwen-Image-2.1 only: round-robin ref distribution. At most this many refs (from -r/-rf/inline) per output, cycling through the pool by image index (default: 1). Avoids multi-ref composition/montage and lets huge batches run unattended. 0 = single-image edit mode (the -i input only; identity-preserving).")
     parser.add_argument('--offset', type=int, default=0, help='Start reading prompt file from this line (default: 0)')
     parser.add_argument('-nc', '--no-clobber', action='store_true', dest='nc', help='No Clobber')
 
@@ -830,50 +832,43 @@ def main():
                         w, h = int(w * _clamp), int(h * _clamp)
                         print(f"Qwen-Image-2.1: clamped output to {w}x{h} (max side {QWEN21_DEFAULT_MAX_SIDE}; use -w/-h or --max-width/--max-height to raise)", file=sys.stderr)
                 qwen_steps = args.steps if args.steps != 4 else QWEN21_DEFAULT_STEPS
-                refs_for_qwen = []
-                if input_image is not None:
-                    refs_for_qwen.append(input_image)
+                qwen_pool = []
+                if ref_images:
+                    for _slot_imgs in ref_images:
+                        qwen_pool.extend(_slot_imgs)
+                qwen_pool.extend(inline_ref_images)
                 if args.ref_file:
                     ref_file_content, ref_file_images = _read_ref_file(
                         args.ref_file, ref_file_content, ref_file_images
                     )
-                    refs_for_qwen.extend(ref_file_images)
-                if ref_slots:
-                    slot_idx = i % len(ref_slots)
-                    inner_idx = i // len(ref_slots) % len(ref_slots[slot_idx])
-                    refs_for_qwen.append(ref_images[slot_idx][inner_idx])
+                    qwen_pool.extend(ref_file_images)
+                n_pool = len(qwen_pool)
+                refs_for_qwen = []
+                if input_image is not None:
+                    refs_for_qwen.append(input_image)
+                if n_pool:
+                    if args.qwen_refs_per_image:
+                        _start = i % n_pool
+                        refs_for_qwen.extend(
+                            qwen_pool[(_start + _k) % n_pool]
+                            for _k in range(min(args.qwen_refs_per_image, n_pool))
+                        )
+                    elif input_image is None:
+                        refs_for_qwen.append(qwen_pool[i % n_pool])
                 if args.cumulative:
                     refs_for_qwen.extend(cum_outs)
-                if inline_ref_images:
-                    refs_for_qwen.extend(inline_ref_images)
                 if len(refs_for_qwen) > QWEN21_MAX_CONDITION_IMAGES:
                     print(f"Qwen-Image-2.1 supports up to {QWEN21_MAX_CONDITION_IMAGES} reference images; got {len(refs_for_qwen)}, truncating", file=sys.stderr)
                     refs_for_qwen = refs_for_qwen[:QWEN21_MAX_CONDITION_IMAGES]
                 if qwen_sd:
+                    if refs_for_qwen and max(w, h) > QWEN21_SD_REF_MAX_SIDE:
+                        print(f"Qwen-Image-2.1 sd.cpp: {len(refs_for_qwen)} refs at {w}x{h}. The FP32 ref prefix cache cannot fit in 24 GB VRAM above {QWEN21_SD_REF_MAX_SIDE}; sd-cli drops the cache and recomputes per step (~30 min/image). Measured fast: t2i 1024², or refs <= {QWEN21_SD_REF_MAX_SIDE}.", file=sys.stderr)
                     _tmpdir = Path(tempfile.mkdtemp(prefix="flux-batch-qwen-"))
                     ref_paths = []
-                    if input_image is not None:
-                        _p = _tmpdir / "input.png"
-                        input_image.save(_p)
+                    for _k, _img in enumerate(refs_for_qwen):
+                        _p = _tmpdir / f"ref{_k}.png"
+                        _img.save(_p)
                         ref_paths.append(_p)
-                    if args.ref_file:
-                        for _j, _img in enumerate(ref_file_images):
-                            _p = _tmpdir / f"reffile{_j}.png"
-                            _img.save(_p)
-                            ref_paths.append(_p)
-                    if ref_slots:
-                        ref_paths.append(Path(ref_slots[slot_idx][inner_idx]))
-                    if args.cumulative:
-                        for _j, _img in enumerate(cum_outs):
-                            _p = _tmpdir / f"cum{_j}.png"
-                            _img.save(_p)
-                            ref_paths.append(_p)
-                    if inline_ref_images:
-                        for _j, _img in enumerate(inline_ref_images):
-                            _p = _tmpdir / f"inline{_j}.png"
-                            _img.save(_p)
-                            ref_paths.append(_p)
-                    ref_paths = ref_paths[:len(refs_for_qwen)]
                     _cfg = args.guidance_scale if args.guidance_scale is not None else args.qwen_sd_cfg
                     run_sd_qwen(
                         QWEN21_SD_CLI, qwen_gguf, QWEN21_SD_LLM, QWEN21_SD_MMPROJ, QWEN21_SD_VAE,

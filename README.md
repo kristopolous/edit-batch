@@ -219,7 +219,11 @@ edit-batch -m qwen-image-2.1 -nsfw -p "prompt.txt" -o out/ --width 1024 --height
 edit-batch -m qwen-image-2.1 -nsfw -i "photo.jpg" -r "refs/*.jpg" -o out/ -p prompt.txt  # edit + refs
 ```
 
-`--qwen-backend` forces the engine: `auto` (default; sd when `-nsfw` and `--qwen-gguf` exists, else diffusers), `sd`, or `diffusers`. `--qwen-gguf` points at the DiT GGUF; `--qwen-sd-dir` overrides the companion directory; `--qwen-sd-cfg` and `--guidance-scale` set CFG (default 6.0). Ref handling matches diffusers mode (input + `-r`/`-rf`/inline/`--cumulative`, capped at 10, order-preserved) and `--output-resolution` maps to sd-cli's `vae_input_max_pixels` (i.e. `resolution²`) to control ref encode cost. All `-r` refs are passed as filesystem paths; input/inline/cumulative refs are staged as temp PNGs.
+`--qwen-backend` forces the engine: `auto` (default; sd when `-nsfw` and `--qwen-gguf` exists, else diffusers), `sd`, or `diffusers`. `--qwen-gguf` points at the DiT GGUF; `--qwen-sd-dir` overrides the companion directory; `--qwen-sd-cfg` and `--guidance-scale` set CFG (default 6.0). `--output-resolution` maps to sd-cli's `vae_input_max_pixels` (i.e. `resolution²`) to control ref encode cost.
+
+**Ref distribution (Qwen montage avoidance):** Qwen-Image-2.1 treats **≥2 reference images as "multi-subject composition"** (it reproduces them side-by-side — e.g. "person on the left, coat on the right") instead of actually editing. To keep big batches unattended, refs from `-r`, `-rf`, and inline `ref:` are pooled and **round-robin delivered by image index**: each output gets at most `--qwen-refs-per-image` refs (default **1**), i.e. the `-i` input (edit target) plus the next rotating ref — `-r "coats/*.jpg"` on a 100k input batch cycles the coat pool across all outputs with no montage. Set `--qwen-refs-per-image 0` for pure single-image edit mode (input only, identity-preserving). Raised values (2+) explicitly opt back into composition mode.
+
+**Measured performance (24 GB 4090, Vulkan, Q4 UC DiT):** t2i at 1024² = ~2.7 s/it (55 s/20 steps), refs (image editing) up to 768² max side = ~2 s/it — both no retry. At **1024² + refs** sd-cli's FP32 ref-prefix cache (~4 GiB per 4096 tokens) misses by ~60 MB, so it drops the cache and recomputes the full sequence every step: **~30 min/image** — the script warns when it sees refs above 768. Keep ref/editing jobs ≤ 768² (edit-batch warns if you exceed it); 1024² is for t2i.
 
 ### Skeleton ControlNet Mode
 
@@ -283,6 +287,7 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--qwen-gguf` | `./qwen-image-2.1-UC-Q4_0.gguf` | Uncensored Qwen-Image-2.1 diffusion GGUF for the sd backend |
 | `--qwen-sd-dir` | `~/.cache/flux-batch/qwen-2.1-sd` | Directory with Qwen3VL text encoder, mmproj, and VAE for the sd backend |
 | `--qwen-sd-cfg` | `6.0` | CFG scale for the sd backend (overridden by `--guidance-scale`) |
+| `--qwen-refs-per-image` | `1` | Qwen round-robin refs per output (from `-r`/`-rf`/inline, cycled by image index); avoid montage. `0` = input-only edit mode |
 | `--offset` | `0` | Start reading prompt file from this line (default: 0) |
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
 | `--shuf` | false | Shuffle input file order randomly |
