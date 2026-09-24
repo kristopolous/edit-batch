@@ -1,6 +1,6 @@
 # edit-batch
 
-Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1).
+Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) including the uncensored models when available using both sd.cpp and transformers with hardware detection.
 
 Run the same prompt across many images with dynamic prompting, static and dynamic reference images, support for multiple generations and step count modification along with multiple text encoders and loras. Optionally use HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 as the backend model.
 
