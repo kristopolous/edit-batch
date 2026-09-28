@@ -221,6 +221,41 @@ edit-batch -m qwen-image-2.1 -nsfw -i "photo.jpg" -r "refs/*.jpg" -o out/ -p pro
 
 `--qwen-backend` forces the engine: `auto` (default; sd when `-nsfw` and `--qwen-gguf` exists, else diffusers), `sd`, or `diffusers`. `--qwen-gguf` points at the DiT GGUF; `--qwen-sd-dir` overrides the companion directory; `--qwen-sd-cfg` and `--guidance-scale` set CFG (default 6.0). `--output-resolution` maps to sd-cli's `vae_input_max_pixels` (i.e. `resolution²`) to control ref encode cost.
 
+#### NSFW Qwen-Image-2.1 LoRA
+
+`-nsfw` auto-applies [Wickedlizerd/NSFW-Qwen-Image-2.1-LoRA](https://huggingface.co/Wickedlizerd/NSFW-Qwen-Image-2.1-LoRA) on top of the uncensored GGUF. It is downloaded once to `~/.cache/flux-batch/loras/nsfw_qwen_21.safetensors` and verified against its published SHA-256 on every use.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--qwen-lora` | cached NSFW LoRA | LoRA path or URL; empty means "no LoRA" |
+| `--qwen-lora-strength` | `1.0` | `--lora-strength` multiplier passed to sd-cli |
+| `--no-qwen-lora` | off | With `-nsfw`, use the uncensored GGUF alone |
+| `--qwen-sampler` | `euler` | sd-cli `--sampling-method` |
+| `--qwen-scheduler` | model default | sd-cli `--scheduler` |
+
+The LoRA is documented against **`er_sde` + `beta` scheduler + ≥25 steps**, so pass those for best results:
+
+```bash
+edit-batch -m qwen-image-2.1 -nsfw -p prompt.txt -o out/ -i "in/*.jpg" \
+  -s 25 --qwen-sampler er_sde --qwen-scheduler beta
+```
+
+Two caveats:
+
+- **This needs a patched `sd-cli`.** Upstream has no CLI flag to load a LoRA file (only `--lora-model-dir` / `--lora-apply-mode`), even though the C API supports `sd_lora_t`. `edit-batch` therefore uses a second binary at `~/.cache/flux-batch/sd-cpp-lora/sd-cli` and only when a LoRA is requested; plain `-nsfw` runs keep using `~/.cache/flux-batch/sd-cpp/sd-cli`. Apply [`sd-cpp-lora.patch`](sd-cpp-lora.patch) to a checkout of stable-diffusion.cpp at `88411ef` and build it:
+
+  ```bash
+  git clone https://github.com/leejet/stable-diffusion.cpp && cd stable-diffusion.cpp
+  git checkout 88411ef && git apply /path/to/sd-cpp-lora.patch
+  apt-get install -y glslc spirv-headers
+  cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSD_VULKAN=ON -DGGML_VULKAN=ON
+  cmake --build build -j"$(nproc)"
+  mkdir -p ~/.cache/flux-batch/sd-cpp-lora
+  install -m755 build/bin/sd-cli ~/.cache/flux-batch/sd-cpp-lora/sd-cli
+  ```
+
+- **160 of 192 target modules apply.** sd.cpp logs the 32 unused `img_mlp.gate_up` A/B tensors as `attn_norm`-style mismatches: the LoRA targets a fused `img_mlp.gate_up`, while sd.cpp names those weights `img_mlp.gate_layer` and `img_mlp.proj`. A plain alias is not enough — the fused tensor has to be split before mapping. The remaining 320/384 tensors do apply, and the rest of the LoRA (attention `to_q`/`to_k`/`to_v`/`to_out.0` and `img_mlp.out`) is correct.
+
 **Ref distribution (Qwen montage avoidance):** Qwen-Image-2.1 treats **≥2 reference images as "multi-subject composition"** (it reproduces them side-by-side — e.g. "person on the left, coat on the right") instead of actually editing. To keep big batches unattended, refs from `-r`, `-rf`, and inline `ref:` are pooled and **round-robin delivered by image index**: each output gets at most `--qwen-refs-per-image` refs (default **1**), i.e. the `-i` input (edit target) plus the next rotating ref — `-r "coats/*.jpg"` on a 100k input batch cycles the coat pool across all outputs with no montage. Set `--qwen-refs-per-image 0` for pure single-image edit mode (input only, identity-preserving). Raised values (2+) explicitly opt back into composition mode. Each iteration prints `qwen refs[N]: <input> + inline:...` so you can see exactly which refs (including inline `ref:` tokens) reached the model; sd.cpp's tensor-load log spam is filtered to WARN/ERROR only.
 
 **Measured performance (24 GB 4090, Vulkan, Q4 UC DiT):** t2i at 1024² = ~2.7 s/it (55 s/20 steps), refs (image editing) up to 768² max side = ~2 s/it — both no retry. At **1024² + refs** sd-cli's FP32 ref-prefix cache (~4 GiB per 4096 tokens) misses by ~60 MB, so it drops the cache and recomputes the full sequence every step: **~30 min/image** — the script warns when it sees refs above 768. Keep ref/editing jobs ≤ 768² (edit-batch warns if you exceed it); 1024² is for t2i.
@@ -287,6 +322,11 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--qwen-gguf` | `./qwen-image-2.1-UC-Q4_0.gguf` | Uncensored Qwen-Image-2.1 diffusion GGUF for the sd backend |
 | `--qwen-sd-dir` | `~/.cache/flux-batch/qwen-2.1-sd` | Directory with Qwen3VL text encoder, mmproj, and VAE for the sd backend |
 | `--qwen-sd-cfg` | `6.0` | CFG scale for the sd backend (overridden by `--guidance-scale`) |
+| `--qwen-lora` | cached NSFW LoRA | Qwen-Image-2.1 LoRA path or URL; auto-applied with `-nsfw` (requires the patched `sd-cli`) |
+| `--qwen-lora-strength` | `1.0` | Multiplier for `--qwen-lora` |
+| `--no-qwen-lora` | off | With `-nsfw`, use the uncensored GGUF without the LoRA |
+| `--qwen-sampler` | `euler` | sd-cli `--sampling-method`; the NSFW LoRA is documented against `er_sde` |
+| `--qwen-scheduler` | model default | sd-cli `--scheduler`; the NSFW LoRA is documented against `beta` |
 | `--qwen-refs-per-image` | `1` | Qwen round-robin refs per output (from `-r`/`-rf`/inline, cycled by image index); avoid montage. `0` = input-only edit mode |
 | `--offset` | `0` | Start reading prompt file from this line (default: 0) |
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
