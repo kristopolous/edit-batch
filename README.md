@@ -1,8 +1,8 @@
 # edit-batch
 
-Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) including the uncensored models when available using both sd.cpp and transformers with hardware detection.
+Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) including the uncensored models when available using both sd.cpp and transformers with hardware detection.
 
-Run the same prompt across many images with dynamic prompting, static and dynamic reference images, support for multiple generations and step count modification along with multiple text encoders and loras. Optionally use HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 as the backend model.
+Run the same prompt across many images with dynamic prompting, static and dynamic reference images, support for multiple generations and step count modification along with multiple text encoders and loras. Optionally use FLUX.3 Image Klein, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 as the backend model.
 
 Repos, GGUFs, and other dependencies are cached under `~/.cache/flux-batch/`.
 
@@ -12,8 +12,9 @@ Repos, GGUFs, and other dependencies are cached under `~/.cache/flux-batch/`.
 # Base dependencies for all backends (flux, hidream, boogu)
 uv pip install -r pyproject.toml          # or: pip install -r requirements.txt
 
-# Qwen-Image-2.1 (--model qwen-image-2.1) additionally requires a diffusers build with
-# QwenImage21Pipeline (upstream PR #14804, not yet in pip releases) plus transformers>=5.17:
+# Qwen-Image-2.1 (--model qwen-image-2.1) and FLUX.3 Image Klein (--model flux3)
+# additionally require a diffusers build with QwenImage21Pipeline / Flux3Transformer2DModel
+# (not yet in pip releases) plus transformers>=5.17:
 uv pip install "git+https://github.com/huggingface/diffusers" "transformers>=5.17"
 ```
 
@@ -260,6 +261,38 @@ Two caveats:
 
 **Measured performance (24 GB 4090, Vulkan, Q4 UC DiT):** t2i at 1024² = ~2.7 s/it (55 s/20 steps), refs (image editing) up to 768² max side = ~2 s/it — both no retry. At **1024² + refs** sd-cli's FP32 ref-prefix cache (~4 GiB per 4096 tokens) misses by ~60 MB, so it drops the cache and recomputes the full sequence every step: **~30 min/image** — the script warns when it sees refs above 768. Keep ref/editing jobs ≤ 768² (edit-batch warns if you exceed it); 1024² is for t2i.
 
+### FLUX.3 Image Klein Mode
+
+Use `--model flux3` to run [FLUX 3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein), BFL's 5.6B open-weights model that unifies text-to-image, single-reference editing, and multi-reference composition (up to 10 reference images) in one flow-mapping model.
+
+The checkpoint is **gated**: accept the FLUX Kommunity License on the model page, then `huggingface-cli login` (or `export HF_TOKEN=...`).
+
+```bash
+# Image editing (input image is the edit target)
+edit-batch --model flux3 -i "*.jpg" -o out/ -p prompt.txt
+
+# Text-to-image
+edit-batch --model flux3 -o out/ -p prompt.txt --width 1024 --height 1024
+
+# Quantized transformer (recommended on a 24 GB card: ~5.6 GB vs 11.2 GB bf16, and Ada
+# e.g. the RTX 4090 runs the fast fp8 kernels natively)
+edit-batch --model flux3 --flux3-quant fp8r -i "*.jpg" -o out/ -p prompt.txt
+```
+
+**Prompting:** the model takes **full scene captions**, not short prompts — a bare request sent as-is produces mediocre output. Two options:
+- Write full scene captions in the prompt file (framing, subject, background, lighting, style).
+- `--flux3-pup` runs BFL's 9B [prompt upsampler](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup) (~18.8 GB, downloaded on first use) once per image before the text encoder, expanding your request (and reference images) into a caption. On a 24 GB card pair this with `--flux3-quant fp8r` — the upsampler pass nearly fills the card. By default the upsampler is off and prompts are encoded as written.
+
+**Multi-reference:** pass references with `-r`/`-rf`/inline `ref:` exactly like the Qwen mode (the `-i` input image is the first reference); address them in the prompt as `<ref_image_0>`, `<ref_image_1>`, ... in list order, e.g. "the hat <ref_image_1> on the person <ref_image_0>". Layout editing works too: append the JSON bounding-box list to the caption as documented in the [BFL docs](https://docs.bfl.ai/flux_3/flux3_image_bounding_boxes). Each reference adds ~4k tokens to every denoise step, so keep the pool small — `--flux3-refs-per-image` round-robin cycles the pool like `--qwen-refs-per-image`.
+
+**Memory:** always runs with automatic CPU offload (one component on the GPU at a time), same as the other backends. bf16 is an 11.2 GB transformer + ~8 GB Qwen3-VL-4B text encoder; `--flux3-quant fp8r` halves the transformer (fast kernels on Ada/Hopper, `nvfp4` is Blackwell-only and needs flashinfer). H100 reference (bf16, no offload): 1024² t2i 16 steps ≈ 1.9 s, one 1024² reference ≈ 3.9 s, peak 23.8 GiB. The script clamps output to a max side of 1024 by default; raise it with `-w`/`-h` or `--max-width`/`--max-height`.
+
+**Distilled vs base:** the default `--flux3-model` is the **distilled** checkpoint (16 steps, no CFG — `-s 16` is the default, `-s` overrides). The undistilled [black-forest-labs/flux-3-image-klein-base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) runs 50 steps with CFG (default `--guidance-scale 3.5`) and is what you fine-tune (LoRA support is included in the pipeline):
+
+```bash
+edit-batch --model flux3 --flux3-model black-forest-labs/flux-3-image-klein-base -s 50 --guidance-scale 3.5 -o out/ -p prompt.txt
+```
+
 ### Skeleton ControlNet Mode
 
 Use `--skeleton` to guide generation with detected human poses or custom skeleton images:
@@ -328,13 +361,17 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--qwen-sampler` | `euler` | sd-cli `--sampling-method`; the NSFW LoRA is documented against `er_sde` |
 | `--qwen-scheduler` | model default | sd-cli `--scheduler`; the NSFW LoRA is documented against `beta` |
 | `--qwen-refs-per-image` | `1` | Qwen round-robin refs per output (from `-r`/`-rf`/inline, cycled by image index); avoid montage. `0` = input-only edit mode |
+| `--flux3-model` | `black-forest-labs/flux-3-image-klein` | FLUX.3 Image Klein repo or local dir: distilled (16 steps, no CFG) or `black-forest-labs/flux-3-image-klein-base` (50 steps, CFG 3.5). Gated — accept the license and `huggingface-cli login` |
+| `--flux3-quant` | `bf16` | FLUX.3 transformer weights: `bf16` (~11.2 GB), `fp8r` (~5.6 GB, fast kernels on Ada/Hopper e.g. RTX 4090), or `nvfp4` (Blackwell only, needs flashinfer), loaded from the repo's `variants/` |
+| `--flux3-pup` | off | Run the 9B FLUX.3 prompt upsampler (~18.8 GB) on each prompt before the text encoder; the model takes full scene captions, so either write them out or pass this flag |
+| `--flux3-refs-per-image` | `1` | FLUX.3 round-robin refs per output like `--qwen-refs-per-image`. `0` = input-only edit mode |
 | `--offset` | `0` | Start reading prompt file from this line (default: 0) |
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
 | `--shuf` | false | Shuffle input file order randomly |
 | `-nc` | false | No Clobber — skip existing outputs |
-| `--model` | `flux` | Model backend: `flux`, `hidream`, `boogu`, or `qwen-image-2.1` |
+| `--model` | `flux` | Model backend: `flux`, `hidream`, `boogu`, `qwen-image-2.1`, or `flux3` |
 | `--model-type` | `full` | HiDream variant: `full` (25 steps) or `dev` (28 steps) |
-| `--guidance-scale` | * | HiDream guidance scale (5.0 full, 0.0 dev) |
+| `--guidance-scale` | * | HiDream guidance scale (5.0 full, 0.0 dev); also FLUX.3 base checkpoint CFG (default 3.5; no effect on the distilled checkpoint) |
 | `--text-guidance-scale` | `5.0` | Text guidance scale for Boogu |
 | `--image-guidance-scale` | `1.0` | Image guidance scale for Boogu |
 | `--seed` | `42` | Random seed for generation |

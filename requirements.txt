@@ -3,8 +3,9 @@ diffusers>=0.33.0
 gguf
 bitsandbytes
 transformers
-# --model qwen (Qwen-Image-2.1) also needs transformers>=5.17 + a diffusers build
-# with QwenImage21Pipeline (pip install -U "git+https://github.com/huggingface/diffusers").
+# --model qwen (Qwen-Image-2.1) and --model flux3 (FLUX.3 Image Klein) also need
+# transformers>=5.17 + a diffusers build with QwenImage21Pipeline / Flux3Transformer2DModel
+# (pip install -U "git+https://github.com/huggingface/diffusers").
 accelerate
 mediapipe
 opencv-python

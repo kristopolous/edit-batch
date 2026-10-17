@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch-process images through FLUX.2 klein (GGUF Q4), HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 with a single prompt."""
+"""Batch-process images through FLUX.2 klein (GGUF Q4), FLUX.3 Image Klein, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 with a single prompt."""
 
 import argparse
 import json
@@ -55,6 +55,17 @@ QWEN21_SD_CFG = 6.0
 QWEN21_NSFW_LORA_URL = "https://huggingface.co/Wickedlizerd/NSFW-Qwen-Image-2.1-LoRA/resolve/main/nsfw_qwen_21.safetensors"
 QWEN21_NSFW_LORA_NAME = "nsfw_qwen_21.safetensors"
 QWEN21_NSFW_LORA_SHA256 = "c29f503f3515877882fd6b10f6849c78a4f2337c09021f4bd4b93d060c311aea"
+
+# FLUX.3 Image Klein (black-forest-labs). Gated repo: accept the FLUX Kommunity
+# License on the model page, then `huggingface-cli login` (or HF_TOKEN).
+FLUX3_MODEL = "black-forest-labs/flux-3-image-klein"          # distilled: 16 steps, no CFG
+FLUX3_BASE_MODEL = "black-forest-labs/flux-3-image-klein-base"  # undistilled: 50 steps, CFG 3.5
+FLUX3_PUP_REPO = "black-forest-labs/flux-3-image-klein-pup"    # 9B prompt upsampler (~18.8 GB)
+FLUX3_DISTILLED_STEPS = 16
+FLUX3_BASE_STEPS = 50
+FLUX3_BASE_GUIDANCE = 3.5
+FLUX3_MAX_CONDITION_IMAGES = 10
+FLUX3_DEFAULT_MAX_SIDE = 1024  # memory-safe default; 5.6B DiT + 4B Qwen3-VL text encoder
 
 LORA_CACHE_DIR = Path.home() / ".cache" / "flux-batch" / "loras"
 LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -236,11 +247,12 @@ def apply_canny(skeleton):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch image processing with FLUX.2 klein Q4 GGUF, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1",
+        description="Batch image processing with FLUX.2 klein Q4 GGUF, FLUX.3 Image Klein, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  flux-batch -in '*.jpg' -out new/ 'repaint this as a disney cartoon'\n"
+            "  flux-batch -m flux3 -i '*.jpg' -o out/ -p prompt.txt  # FLUX.3 Image Klein\n"
         ),
     )
     try:
@@ -276,7 +288,7 @@ def main():
     ## -h is help
     parser.add_argument("--height", type=int, help="Explicit output height (enforced)")
     parser.add_argument("-i", "--in", dest="input_glob", help="Glob pattern for input images (e.g. '*.jpg')")
-    parser.add_argument("-m", "--model", default="flux", choices=["flux", "hidream", "boogu", "qwen-image-2.1"], help="Model to use (default: flux)")
+    parser.add_argument("-m", "--model", default="flux", choices=["flux", "hidream", "boogu", "qwen-image-2.1", "flux3"], help="Model to use (default: flux)")
     parser.add_argument("-o", "--out", required=True, dest="output_dir", help="Directory to write output images")
     parser.add_argument("-p", "--prompt", required=True, help="Prompt from a file applied to every image")
     parser.add_argument("-r", "--ref", action="append", dest="refs", metavar="IMAGE", help="Reference image(s), can be specified multiple times")
@@ -296,6 +308,10 @@ def main():
     parser.add_argument("--qwen-scheduler", default="", help="sd-cli denoiser scheduler for --qwen-backend sd (default: model-specific). The NSFW Qwen-Image-2.1 LoRA is documented against beta")
     parser.add_argument("--no-qwen-lora", action="store_true", help="With -nsfw, do not auto-apply the NSFW Qwen-Image-2.1 LoRA (use the uncensored GGUF alone)")
     parser.add_argument("--qwen-refs-per-image", type=int, default=1, help="Qwen-Image-2.1 only: round-robin ref distribution. At most this many refs (from -r/-rf/inline) per output, cycling through the pool by image index (default: 1). Avoids multi-ref composition/montage and lets huge batches run unattended. 0 = single-image edit mode (the -i input only; identity-preserving).")
+    parser.add_argument("--flux3-model", default=FLUX3_MODEL, help=f"FLUX.3 Image Klein model repo or local dir (default: {FLUX3_MODEL}, the distilled 16-step no-CFG checkpoint; use {FLUX3_BASE_MODEL} for the undistilled 50-step CFG checkpoint)")
+    parser.add_argument("--flux3-quant", default="bf16", choices=["bf16", "fp8r", "nvfp4"], help="FLUX.3 transformer weights: bf16 (default, ~11.2 GB), fp8r (quantized single file, ~5.6 GB, fast kernels on Ada/Hopper/Blackwell e.g. RTX 4090), or nvfp4 (Blackwell only, needs flashinfer)")
+    parser.add_argument("--flux3-pup", action='store_true', help=f"Run the FLUX.3 prompt upsampler ({FLUX3_PUP_REPO}, ~18.8 GB download) on each prompt before the text encoder. Off by default: prompts are encoded as written. The model takes full scene captions, so either write them out or pass this flag")
+    parser.add_argument("--flux3-refs-per-image", type=int, default=1, help="FLUX.3 only: round-robin ref distribution like --qwen-refs-per-image (default: 1). 0 = single-image edit mode (the -i input only)")
     parser.add_argument('--offset', type=int, default=0, help='Start reading prompt file from this line (default: 0)')
     parser.add_argument('-nc', '--no-clobber', action='store_true', dest='nc', help='No Clobber')
 
@@ -355,6 +371,57 @@ def main():
         total_slots = len(ref_slots)
         total_refs = sum(len(s) for s in ref_slots)
         print(f"Loaded {total_refs} reference image(s) across {total_slots} slot(s)", file=sys.stderr)
+
+    def assemble_edit_refs(i, input_image, inpath, inline_ref_paths, inline_ref_images,
+                           cum_outs, ref_file_content, ref_file_images, refs_per_image,
+                           max_refs, label):
+        """Assemble condition images for a unified edit model (Qwen-Image-2.1, FLUX.3).
+
+        Order: input image (edit target), then up to refs_per_image refs cycled
+        round-robin from the -r/-rf/inline pool by image index (0 = input-only edit
+        mode, or the pool when there is no input), then --cumulative outputs.
+        Truncated to max_refs. Returns (refs, used_labels, ref_file_content, ref_file_images).
+        """
+        pool = []
+        for _sidx, _slot_imgs in enumerate(ref_images):
+            _slot_src = ref_slots[_sidx] if _sidx < len(ref_slots) else []
+            for _k, _img in enumerate(_slot_imgs):
+                _src = _slot_src[_k] if _k < len(_slot_src) else f"slot{_sidx}#{_k}"
+                pool.append((str(_src), _img))
+        for _rp, _img in zip(inline_ref_paths, inline_ref_images):
+            pool.append((f"inline:{_rp}", _img))
+        if args.ref_file:
+            ref_file_content, ref_file_images = _read_ref_file(
+                args.ref_file, ref_file_content, ref_file_images
+            )
+            pool.extend((f"ref-file#{_j}", _img) for _j, _img in enumerate(ref_file_images))
+        n_pool = len(pool)
+        refs = []
+        used_labels = []
+        if input_image is not None:
+            refs.append(input_image)
+            used_labels.append(inpath if inpath else "no-input")
+        if n_pool:
+            if refs_per_image:
+                _start = i % n_pool
+                for _k in range(min(refs_per_image, n_pool)):
+                    _pl = pool[(_start + _k) % n_pool]
+                    refs.append(_pl[1])
+                    used_labels.append(_pl[0])
+            elif input_image is None:
+                _pl = pool[i % n_pool]
+                refs.append(_pl[1])
+                used_labels.append(_pl[0])
+        if args.cumulative:
+            for _j, _img in enumerate(cum_outs):
+                refs.append(_img)
+                used_labels.append(f"cum#{_j}")
+        if len(refs) > max_refs:
+            print(f"{label} supports up to {max_refs} reference images; got {len(refs)}, truncating", file=sys.stderr)
+            refs = refs[:max_refs]
+            used_labels = used_labels[:max_refs]
+        print(f"{label} refs[{i}]: {' + '.join(used_labels) if used_labels else '(none)'}", file=sys.stderr)
+        return refs, used_labels, ref_file_content, ref_file_images
 
     if args.model == "qwen-image-2.1":
         qwen_sd_dir = Path(args.qwen_sd_dir) if args.qwen_sd_dir else QWEN21_SD_DIR
@@ -630,6 +697,77 @@ def main():
             pipe.enable_model_cpu_offload()
             t1 = time.time()
             print(f"Qwen-Image-2.1 model ready in {t1 - t0:.1f}s", file=sys.stderr)
+    elif args.model == "flux3":
+        import diffusers as _flux3_diffusers
+        if not hasattr(_flux3_diffusers, "Flux3Transformer2DModel"):
+            print("Error: --model flux3 requires a diffusers build with FLUX.3 support (Flux3Transformer2DModel, ModularPipeline).", file=sys.stderr)
+            print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers' 'transformers>=5.17'", file=sys.stderr)
+            sys.exit(1)
+        from diffusers import ComponentsManager, ModularPipeline
+        flux3_model = args.flux3_model
+        flux3_is_base = flux3_model.rstrip("/").split("/")[-1].endswith("-base")
+        flux3_steps_default = FLUX3_BASE_STEPS if flux3_is_base else FLUX3_DISTILLED_STEPS
+        t0 = time.time()
+        print(f"Loading FLUX.3 Image Klein from {flux3_model} (transformer: {args.flux3_quant}) ...", file=sys.stderr)
+        # Automatic CPU offload: bf16 the model is ~20 GB (11.2 GB DiT + ~8 GB Qwen3-VL-4B
+        # encoder) so one component lives on the GPU at a time, same as the other backends.
+        manager = ComponentsManager()
+        manager.enable_auto_cpu_offload(device=args.device)
+        try:
+            pipe = ModularPipeline.from_pretrained(flux3_model, components_manager=manager)
+        except Exception as e:
+            print(f"Error: failed to load {flux3_model}: {e}", file=sys.stderr)
+            print("       This repo is gated: accept the FLUX Kommunity License on the model page,", file=sys.stderr)
+            print("       then `huggingface-cli login` (or export HF_TOKEN) and retry.", file=sys.stderr)
+            sys.exit(1)
+        if args.flux3_pup:
+            print(f"FLUX.3 prompt upsampler on: {FLUX3_PUP_REPO} (~18.8 GB, downloaded on first use; expands the prompt + refs into a scene caption per image)", file=sys.stderr)
+        else:
+            # The prompt upsampler is a separate 9B LLM the pipeline runs before the text
+            # encoder. Pop the block so prompts are encoded as written (--flux3-pup keeps it).
+            # NB: `pipe.blocks` is a read-only deepcopy property; the live execution blocks
+            # are `pipe._blocks`. Popping before load_components keeps the pup out of the
+            # workflow's component list, so it is not downloaded.
+            pipe._blocks.sub_blocks.pop("prompt_upsampler")
+            print("FLUX.3 prompt upsampler off: prompts are encoded as written. The model takes full scene captions - write them out, or pass --flux3-pup.", file=sys.stderr)
+        _flux3_dtype = {"vae": torch.float32, "default": torch.bfloat16} if flux3_is_base else torch.bfloat16
+        if args.flux3_quant == "bf16":
+            pipe.load_components(workflow="image_conditioned", dtype=_flux3_dtype)
+        else:
+            try:
+                from diffusers import BFLQuantizationConfig, Flux3Transformer2DModel
+            except ImportError:
+                print(f"Error: --flux3-quant {args.flux3_quant} needs BFLQuantizationConfig (newer diffusers build).", file=sys.stderr)
+                print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers'", file=sys.stderr)
+                sys.exit(1)
+            # Load everything the workflow needs except the transformer, then swap in the
+            # quantized single file (skips the 11.2 GB bf16 download).
+            _wf_names = {spec.name for spec in pipe.blocks.get_workflow("image_conditioned").expected_components}
+            pipe.load_components(names=[n for n in _wf_names if n != "transformer"], dtype=_flux3_dtype)
+            _variant_url = f"https://huggingface.co/{flux3_model}/resolve/main/variants/{args.flux3_quant}/model.safetensors"
+            print(f"Loading {args.flux3_quant} transformer from {_variant_url} ...", file=sys.stderr)
+            transformer = Flux3Transformer2DModel.from_single_file(
+                _variant_url,
+                config=flux3_model,
+                subfolder="transformer",
+                quantization_config=BFLQuantizationConfig(compute_dtype=torch.bfloat16),
+                dtype=torch.bfloat16,
+            )
+            pipe.update_components(transformer=transformer)
+        if getattr(pipe, "transformer", None) is None:
+            print(f"Error: the FLUX.3 transformer did not load from {flux3_model}.", file=sys.stderr)
+            print("       This repo is gated: accept the FLUX Kommunity License on the model page,", file=sys.stderr)
+            print("       then `huggingface-cli login` (or export HF_TOKEN) and retry.", file=sys.stderr)
+            sys.exit(1)
+        if flux3_is_base:
+            # Undistilled checkpoint: 50 steps with classifier-free guidance (default 3.5)
+            flux3_guidance = args.guidance_scale if args.guidance_scale is not None else FLUX3_BASE_GUIDANCE
+            pipe.guider = pipe.guider.new(guidance_scale=flux3_guidance)
+            print(f"FLUX.3 base: {flux3_steps_default} steps, guidance {flux3_guidance}", file=sys.stderr)
+        elif args.guidance_scale is not None:
+            print("Warning: the distilled FLUX.3 checkpoint is flow-map distilled (no CFG); --guidance-scale has no effect. Use --flux3-model ...-base for CFG.", file=sys.stderr)
+        t1 = time.time()
+        print(f"FLUX.3 model ready in {t1 - t0:.1f}s (auto CPU offload on {args.device})", file=sys.stderr)
     elif args.skeleton:
         from transformers import AutoModel, AutoTokenizer
         print(f"Loading ControlNet pipeline with {args.controlnet} ...", file=sys.stderr)
@@ -908,46 +1046,10 @@ def main():
                         w, h = int(w * _clamp), int(h * _clamp)
                         print(f"Qwen-Image-2.1: clamped output to {w}x{h} (max side {QWEN21_DEFAULT_MAX_SIDE}; use -w/-h or --max-width/--max-height to raise)", file=sys.stderr)
                 qwen_steps = args.steps if args.steps != 4 else QWEN21_DEFAULT_STEPS
-                qwen_pool = []
-                if ref_images:
-                    for _sidx, _slot_imgs in enumerate(ref_images):
-                        _slot_src = ref_slots[_sidx] if _sidx < len(ref_slots) else []
-                        for _k, _img in enumerate(_slot_imgs):
-                            _src = _slot_src[_k] if _k < len(_slot_src) else f"slot{_sidx}#{_k}"
-                            qwen_pool.append((str(_src), _img))
-                for _rp, _img in zip(inline_ref_paths, inline_ref_images):
-                    qwen_pool.append((f"inline:{_rp}", _img))
-                if args.ref_file:
-                    ref_file_content, ref_file_images = _read_ref_file(
-                        args.ref_file, ref_file_content, ref_file_images
-                    )
-                    qwen_pool.extend((f"ref-file#{_j}", _img) for _j, _img in enumerate(ref_file_images))
-                n_pool = len(qwen_pool)
-                refs_for_qwen = []
-                used_labels = []
-                if input_image is not None:
-                    refs_for_qwen.append(input_image)
-                    used_labels.append(inpath if inpath else "no-input")
-                if n_pool:
-                    if args.qwen_refs_per_image:
-                        _start = i % n_pool
-                        for _k in range(min(args.qwen_refs_per_image, n_pool)):
-                            _pl = qwen_pool[(_start + _k) % n_pool]
-                            refs_for_qwen.append(_pl[1])
-                            used_labels.append(_pl[0])
-                    elif input_image is None:
-                        _pl = qwen_pool[i % n_pool]
-                        refs_for_qwen.append(_pl[1])
-                        used_labels.append(_pl[0])
-                if args.cumulative:
-                    for _j, _img in enumerate(cum_outs):
-                        refs_for_qwen.append(_img)
-                        used_labels.append(f"cum#{_j}")
-                if len(refs_for_qwen) > QWEN21_MAX_CONDITION_IMAGES:
-                    print(f"Qwen-Image-2.1 supports up to {QWEN21_MAX_CONDITION_IMAGES} reference images; got {len(refs_for_qwen)}, truncating", file=sys.stderr)
-                    refs_for_qwen = refs_for_qwen[:QWEN21_MAX_CONDITION_IMAGES]
-                    used_labels = used_labels[:len(refs_for_qwen)]
-                print(f"qwen refs[{i}]: {' + '.join(used_labels) if used_labels else '(none)'}", file=sys.stderr)
+                refs_for_qwen, _qwen_labels, ref_file_content, ref_file_images = assemble_edit_refs(
+                    i, input_image, inpath, inline_ref_paths, inline_ref_images, cum_outs,
+                    ref_file_content, ref_file_images, args.qwen_refs_per_image,
+                    QWEN21_MAX_CONDITION_IMAGES, "qwen")
                 if qwen_sd:
                     if refs_for_qwen and max(w, h) > QWEN21_SD_REF_MAX_SIDE:
                         print(f"Qwen-Image-2.1 sd.cpp: {len(refs_for_qwen)} refs at {w}x{h}. The FP32 ref prefix cache cannot fit in 24 GB VRAM above {QWEN21_SD_REF_MAX_SIDE}; sd-cli drops the cache and recomputes per step (~30 min/image). Measured fast: t2i 1024², or refs <= {QWEN21_SD_REF_MAX_SIDE}.", file=sys.stderr)
@@ -984,6 +1086,37 @@ def main():
                     result = pipe(**pipe_kwargs)
                     image = result.images[0]
                     write_image(image, outpath, prompt, args.seed)
+                if args.cumulative:
+                    cum_outs.append(image)
+                elapsed = time.time() - t_start
+                print(f"{elapsed:.1f}s -> {outpath}", file=sys.stderr)
+                continue
+
+            if args.model == "flux3":
+                if not (args.width or args.height or args.max_width or args.max_height):
+                    if max(w, h) > FLUX3_DEFAULT_MAX_SIDE:
+                        _clamp = FLUX3_DEFAULT_MAX_SIDE / max(w, h)
+                        w, h = int(w * _clamp), int(h * _clamp)
+                        print(f"FLUX.3: clamped output to {w}x{h} (max side {FLUX3_DEFAULT_MAX_SIDE}; use -w/-h or --max-width/--max-height to raise)", file=sys.stderr)
+                flux3_steps = args.steps if args.steps != 4 else flux3_steps_default
+                refs_for_flux3, _flux3_labels, ref_file_content, ref_file_images = assemble_edit_refs(
+                    i, input_image, inpath, inline_ref_paths, inline_ref_images, cum_outs,
+                    ref_file_content, ref_file_images, args.flux3_refs_per_image,
+                    FLUX3_MAX_CONDITION_IMAGES, "flux3")
+                generator = torch.Generator(device=args.device).manual_seed(args.seed)
+                pipe_kwargs = dict(
+                    prompt=prompt,
+                    height=h & ~0xf,
+                    width=w & ~0xf,
+                    num_inference_steps=flux3_steps,
+                    generator=generator,
+                    output="images",
+                )
+                if refs_for_flux3:
+                    pipe_kwargs["image"] = refs_for_flux3[0] if len(refs_for_flux3) == 1 else refs_for_flux3
+                result = pipe(**pipe_kwargs)
+                image = result[0]
+                write_image(image, outpath, prompt, args.seed)
                 if args.cumulative:
                     cum_outs.append(image)
                 elapsed = time.time() - t_start

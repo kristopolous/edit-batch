@@ -1,7 +1,7 @@
 [project]
 name = "edit-batch"
 version = "0.1.1"
-description = "Batch image processing with FLUX.2 klein Q4 GGUF, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1"
+description = "Batch image processing with FLUX.2 klein Q4 GGUF, FLUX.3 Image Klein, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
