@@ -744,10 +744,13 @@ def main():
             # quantized single file (skips the 11.2 GB bf16 download).
             _wf_names = {spec.name for spec in pipe.blocks.get_workflow("image_conditioned").expected_components}
             pipe.load_components(names=[n for n in _wf_names if n != "transformer"], dtype=_flux3_dtype)
-            _variant_url = f"https://huggingface.co/{flux3_model}/resolve/main/variants/{args.flux3_quant}/model.safetensors"
-            print(f"Loading {args.flux3_quant} transformer from {_variant_url} ...", file=sys.stderr)
+            # from_single_file takes a local file or a repo_id/weights_name path (a full
+            # https:// URL gets mangled), so fetch the variant file into the HF cache first
+            from huggingface_hub import hf_hub_download
+            _variant_path = hf_hub_download(flux3_model, f"variants/{args.flux3_quant}/model.safetensors")
+            print(f"Loading {args.flux3_quant} transformer from {_variant_path} ...", file=sys.stderr)
             transformer = Flux3Transformer2DModel.from_single_file(
-                _variant_url,
+                _variant_path,
                 config=flux3_model,
                 subfolder="transformer",
                 quantization_config=BFLQuantizationConfig(compute_dtype=torch.bfloat16),
