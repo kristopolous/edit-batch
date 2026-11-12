@@ -141,32 +141,39 @@ def run_flux3_pup(llama_cli, pup_gguf, mmproj, sysprompts_path, prompt, ref_path
     has_refs = bool(ref_paths)
     sys_prompt = sysprompts["i2i" if has_refs else "t2i"]
     request = prompt if has_refs else f"TARGET CANVAS: {width}:{height}\n{prompt}"
-    fd, out_file = tempfile.mkstemp(prefix="flux-batch-pup-", suffix=".txt")
-    os.close(fd)
-    cmd = [
-        str(llama_cli),
-        "--simple-io",
-        "--no-display-prompt",
-        "-m", str(pup_gguf),
-        "--jinja",
-        "--chat-template-kwargs", '{"enable_thinking": false}',
-        "--temp", "0",
-        "--penalty-p", "1.5",
-        "-c", "8192",
-        "-n", "4096",
-        "-st",
-        "-sys", sys_prompt,
-        "-p", request,
-        "-o", out_file,
-    ]
-    if has_refs:
-        cmd += ["--mmproj", str(mmproj), "--image", ",".join(str(r) for r in ref_paths)]
-    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    caption = Path(out_file).read_text().strip() if Path(out_file).exists() else ""
-    Path(out_file).unlink(missing_ok=True)
-    if proc.returncode != 0 or not caption:
-        print(f"Error: the FLUX.3 prompt upsampler failed (rc={proc.returncode}):", file=sys.stderr)
-        tail = proc.stderr.strip().splitlines()[-15:]
+    def _run(penalty_flag):
+        fd, out_file = tempfile.mkstemp(prefix="flux-batch-pup-", suffix=".txt")
+        os.close(fd)
+        cmd = [
+            str(llama_cli),
+            "--simple-io",
+            "--no-display-prompt",
+            "-m", str(pup_gguf),
+            "--jinja",
+            "--chat-template-kwargs", '{"enable_thinking": false}',
+            "--temp", "0",
+            penalty_flag, "1.5",
+            "-c", "8192",
+            "-n", "4096",
+            "-st",
+            "-sys", sys_prompt,
+            "-p", request,
+            "-o", out_file,
+        ]
+        if has_refs:
+            cmd += ["--mmproj", str(mmproj), "--image", ",".join(str(r) for r in ref_paths)]
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        caption = Path(out_file).read_text().strip() if Path(out_file).exists() else ""
+        Path(out_file).unlink(missing_ok=True)
+        return proc.returncode, caption, proc.stderr
+
+    rc, caption, err = _run("--presence-penalty")
+    # Older llama.cpp builds spell the flag --penalty-p; try that before giving up.
+    if rc != 0 and not caption and "--presence-penalty" in err:
+        rc, caption, err = _run("--penalty-p")
+    if rc != 0 or not caption:
+        print(f"Error: the FLUX.3 prompt upsampler failed (rc={rc}):", file=sys.stderr)
+        tail = err.strip().splitlines()[-15:]
         for line in tail:
             print(f"  {line}", file=sys.stderr)
         sys.exit(1)
