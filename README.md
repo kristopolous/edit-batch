@@ -283,6 +283,15 @@ edit-batch --model flux3 --flux3-quant fp8r -i "*.jpg" -o out/ -p prompt.txt
 - Write full scene captions in the prompt file (framing, subject, background, lighting, style).
 - `--flux3-pup` runs BFL's 9B [prompt upsampler](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup) (~18.8 GB, downloaded on first use) once per image before the text encoder, expanding your request (and reference images) into a caption. On a 24 GB card pair this with `--flux3-quant fp8r` — the upsampler pass nearly fills the card. By default the upsampler is off and prompts are encoded as written.
 
+**NSFW / sd.cpp backend (`-nsfw`):** `-m flux3 --nsfw` runs the whole pipeline through `sd-cli` (Vulkan) on the uncensored AtomicChat releases instead of the gated BFL repo: [FLUX-3-Image-Klein-TE-Uncensored-GGUF](https://huggingface.co/AtomicChat/FLUX-3-Image-Klein-TE-Uncensored-GGUF) (the Qwen3-VL-4B text encoder with its refusal direction projected out, as a drop-in `--llm`) and [FLUX-3-Image-Klein-pup-Uncensored-GGUF](https://huggingface.co/AtomicChat/FLUX-3-Image-Klein-pup-Uncensored-GGUF) (the refusal-free 9B prompt upsampler, run through llama.cpp when `--flux3-pup` is on). The uncensored encoder only runs in stable-diffusion.cpp — that's why this route is sd.cpp — and the open Klein pipeline has no image-side filter to remove, so this changes the encoder/upsampler, not a content gate. The DiT, VAE and the encoder's vision projector come from [AtomicChat/FLUX-3-Image-Klein-GGUF](https://huggingface.co/AtomicChat/FLUX-3-Image-Klein-GGUF) (default DiT: AD-Q5_K, ~4.4 GB); everything auto-downloads to `~/.cache/flux-batch/flux3-sd/` on first use. Runs the distilled schedule: 16 steps at CFG 1, euler, BFL's default time shift.
+
+```bash
+edit-batch -m flux3 --nsfw -o out/ -p prompt.txt --width 1024 --height 1024      # t2i
+edit-batch -m flux3 --nsfw --flux3-pup -i "*.jpg" -o out/ -p prompt.txt          # edits, captioned per image
+```
+
+Requires `sd-cli` built from stable-diffusion.cpp `master` with FLUX.3 support (leejet/stable-diffusion.cpp#2143) at `~/.cache/flux-batch/sd-cpp/sd-cli` (the same binary as the Qwen sd path) and llama.cpp's `llama-cli` on `PATH` or at `~/.cache/flux-batch/llama.cpp/llama-cli` for the upsampler.
+
 **Multi-reference:** pass references with `-r`/`-rf`/inline `ref:` exactly like the Qwen mode (the `-i` input image is the first reference); address them in the prompt as `<ref_image_0>`, `<ref_image_1>`, ... in list order, e.g. "the hat <ref_image_1> on the person <ref_image_0>". Layout editing works too: append the JSON bounding-box list to the caption as documented in the [BFL docs](https://docs.bfl.ai/flux_3/flux3_image_bounding_boxes). Each reference adds ~4k tokens to every denoise step, so keep the pool small — `--flux3-refs-per-image` round-robin cycles the pool like `--qwen-refs-per-image`.
 
 **Memory:** always runs with automatic CPU offload (one component on the GPU at a time), same as the other backends. bf16 is an 11.2 GB transformer + ~8 GB Qwen3-VL-4B text encoder; `--flux3-quant fp8r` halves the transformer (fast kernels on Ada/Hopper, `nvfp4` is Blackwell-only and needs flashinfer). H100 reference (bf16, no offload): 1024² t2i 16 steps ≈ 1.9 s, one 1024² reference ≈ 3.9 s, peak 23.8 GiB. The script clamps output to a max side of 1024 by default; raise it with `-w`/`-h` or `--max-width`/`--max-height`.
@@ -343,7 +352,7 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--skeleton-image` | — | Pre-generated skeleton/control image (supports glob patterns) |
 | `--controlnet` | `InstantX/FLUX.1-dev-Controlnet-Canny` | ControlNet model |
 | `--exact` | false | Use [exact](https://huggingface.co/dx8152/Flux2-Klein-9B-Consistency) text encoder (LoRA) |
-| `--nsfw` | false | Use [uncensored](https://huggingface.co/ponpoke/flux2-klein-9b-uncensored-text-encoder) text encoder + anatomy fixer LoRA |
+| `--nsfw` | false | FLUX.2: [uncensored](https://huggingface.co/ponpoke/flux2-klein-9b-uncensored-text-encoder) text encoder + anatomy fixer LoRA. FLUX.3: sd.cpp backend with the [uncensored](https://huggingface.co/AtomicChat/FLUX-3-Image-Klein-TE-Uncensored-GGUF) text encoder (+ uncensored prompt upsampler with `--flux3-pup`) — see the FLUX.3 section |
 | `--nsfw-lora` | — | Custom LoRA URL/path for --nsfw (default: Klein anatomy fixer from CivitAI) |
 | `--lora-strength` | `2.5` | LoRA strength (recommended range: 1.0-3.0) |
 | `--scale` | `1.0` | Output size multiplier relative to input (e.g. 0.5 for half, 2.0 for double) |
@@ -365,6 +374,11 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--flux3-quant` | `bf16` | FLUX.3 transformer weights: `bf16` (~11.2 GB), `fp8r` (~5.6 GB, fast kernels on Ada/Hopper e.g. RTX 4090), or `nvfp4` (Blackwell only, needs flashinfer), loaded from the repo's `variants/` |
 | `--flux3-pup` | off | Run the 9B FLUX.3 prompt upsampler (~18.8 GB) on each prompt before the text encoder; the model takes full scene captions, so either write them out or pass this flag |
 | `--flux3-refs-per-image` | `1` | FLUX.3 round-robin refs per output like `--qwen-refs-per-image`. `0` = input-only edit mode |
+| `--flux3-backend` | `auto` | FLUX.3 engine: `sd` (stable-diffusion.cpp; uncensored AtomicChat GGUFs — the `--nsfw` route), `diffusers` (BFL's gated HF weights), `auto` (sd when `-nsfw`, else diffusers) |
+| `--flux3-gguf` | `FLUX-3-Image-Klein-AD-Q5_K.gguf` | FLUX.3 DiT GGUF for the sd backend (auto-downloaded from `AtomicChat/FLUX-3-Image-Klein-GGUF`) |
+| `--flux3-llm` | `Qwen3-VL-4B-Instruct-Uncensored-Q8_0.gguf` | FLUX.3 text encoder GGUF for the sd backend (auto-downloaded from `AtomicChat/FLUX-3-Image-Klein-TE-Uncensored-GGUF`) |
+| `--flux3-pup-gguf` | `FLUX-3-Image-Klein-pup-Uncensored-AD-IQ4_XS.gguf` | FLUX.3 prompt upsampler GGUF for the sd backend (auto-downloaded from `AtomicChat/FLUX-3-Image-Klein-pup-Uncensored-GGUF`) |
+| `--flux3-llama-cli` | `~/.cache/flux-batch/llama.cpp/llama-cli` or `PATH` | llama.cpp binary for the sd prompt upsampler |
 | `--offset` | `0` | Start reading prompt file from this line (default: 0) |
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
 | `--shuf` | false | Shuffle input file order randomly |

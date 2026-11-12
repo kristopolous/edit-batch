@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import shutil
 import sys
 import os
 import re
@@ -67,6 +68,28 @@ FLUX3_BASE_GUIDANCE = 3.5
 FLUX3_MAX_CONDITION_IMAGES = 10
 FLUX3_DEFAULT_MAX_SIDE = 1024  # memory-safe default; 5.6B DiT + 4B Qwen3-VL text encoder
 
+# FLUX.3 Image Klein on stable-diffusion.cpp (--model flux3 --nsfw). The uncensored text
+# encoder is Qwen3-VL-4B-Instruct with its refusal direction projected out — a GGUF that
+# only runs as sd-cli --llm (diffusers/ComfyUI can't load it) — so the NSFW route runs the
+# whole pipeline through sd.cpp like the Qwen-Image-2.1 NSFW route. The uncensored prompt
+# upsampler is a llama.cpp GGUF run once per image before the diffusion pass. All files are
+# auto-downloaded to FLUX3_SD_DIR on first use.
+FLUX3_SD_DIR = Path.home() / ".cache" / "flux-batch" / "flux3-sd"
+FLUX3_SD_CLI = QWEN21_SD_DIR.parent / "sd-cpp" / "sd-cli"  # same sd.cpp build as the Qwen path
+FLUX3_SD_DIT_REPO = "AtomicChat/FLUX-3-Image-Klein-GGUF"
+FLUX3_SD_DIT = "FLUX-3-Image-Klein-AD-Q5_K.gguf"           # 4.44 GB distilled DiT
+FLUX3_SD_VAE = "vae/ae.safetensors"
+FLUX3_SD_TE_REPO = "AtomicChat/FLUX-3-Image-Klein-TE-Uncensored-GGUF"
+FLUX3_SD_TE = "Qwen3-VL-4B-Instruct-Uncensored-Q8_0.gguf"  # 4.28 GB refusal-free encoder
+FLUX3_SD_MMPROJ_REPO = "Qwen/Qwen3-VL-4B-Instruct-GGUF"
+FLUX3_SD_MMPROJ = "mmproj-Qwen3VL-4B-Instruct-F16.gguf"    # encoder vision tower, for -r edits
+FLUX3_PUP_SD_REPO = "AtomicChat/FLUX-3-Image-Klein-pup-Uncensored-GGUF"
+FLUX3_PUP_SD_GGUF = "FLUX-3-Image-Klein-pup-Uncensored-AD-IQ4_XS.gguf"  # 5.51 GB
+FLUX3_PUP_SD_MMPROJ = "mmproj-FLUX-3-Image-Klein-pup-Uncensored-F16.gguf"
+FLUX3_PUP_SD_PROMPTS = "system_prompts.json"
+FLUX3_SD_CFG = 1.0  # distilled schedule: 16 steps, CFG 1, euler, BFL's default time shift
+FLUX3_LLAMA_CLI = Path.home() / ".cache" / "flux-batch" / "llama.cpp" / "llama-cli"
+
 LORA_CACHE_DIR = Path.home() / ".cache" / "flux-batch" / "loras"
 LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -93,6 +116,101 @@ def download_file(url, dest):
     result = subprocess.run(['curl', '-L', '-s', '-o', str(dest), url], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to download {url}: {result.stderr}")
+
+def fetch_flux3_sd_file(repo, filename):
+    """Download one FLUX.3 sd.cpp file from Hugging Face into the local cache dir.
+
+    Returns the local path; no network access when the file is already present.
+    """
+    dest = FLUX3_SD_DIR / filename
+    if dest.exists():
+        return dest
+    from huggingface_hub import hf_hub_download
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {repo}/{filename} -> {dest} ...", file=sys.stderr)
+    return Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=FLUX3_SD_DIR))
+
+def run_flux3_pup(llama_cli, pup_gguf, mmproj, sysprompts_path, prompt, ref_paths, width, height):
+    """Expand a short request into a full Klein caption via the uncensored prompt upsampler.
+
+    Runs llama.cpp's llama-cli on the 9B upsampler GGUF with BFL's t2i/i2i system prompt
+    (BFL's recipe: greedy, presence penalty 1.5, thinking off). Returns the caption text.
+    """
+    import subprocess
+    sysprompts = json.loads(sysprompts_path.read_text())
+    has_refs = bool(ref_paths)
+    sys_prompt = sysprompts["i2i" if has_refs else "t2i"]
+    request = prompt if has_refs else f"TARGET CANVAS: {width}:{height}\n{prompt}"
+    fd, out_file = tempfile.mkstemp(prefix="flux-batch-pup-", suffix=".txt")
+    os.close(fd)
+    cmd = [
+        str(llama_cli),
+        "--simple-io",
+        "--no-display-prompt",
+        "-m", str(pup_gguf),
+        "--jinja",
+        "--chat-template-kwargs", '{"enable_thinking": false}',
+        "--temp", "0",
+        "--penalty-p", "1.5",
+        "-c", "8192",
+        "-n", "4096",
+        "-st",
+        "-sys", sys_prompt,
+        "-p", request,
+        "-o", out_file,
+    ]
+    if has_refs:
+        cmd += ["--mmproj", str(mmproj), "--image", ",".join(str(r) for r in ref_paths)]
+    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    caption = Path(out_file).read_text().strip() if Path(out_file).exists() else ""
+    Path(out_file).unlink(missing_ok=True)
+    if proc.returncode != 0 or not caption:
+        print(f"Error: the FLUX.3 prompt upsampler failed (rc={proc.returncode}):", file=sys.stderr)
+        tail = proc.stderr.strip().splitlines()[-15:]
+        for line in tail:
+            print(f"  {line}", file=sys.stderr)
+        sys.exit(1)
+    return caption
+
+def run_sd_flux3(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, steps, cfg, seed, ref_paths):
+    """Run FLUX.3 Image Klein through stable-diffusion.cpp (sd-cli) with GGUF weights.
+
+    The distilled checkpoint runs 16 steps at CFG 1 with euler on BFL's default schedule
+    (time shift 6.93). Like the Qwen path there is no --offload-to-cpu: the quantized DiT
+    (~4.4 GB) + Qwen3-VL encoder (~4.3 GB) + VAE fit in ~24 GB VRAM and sd.cpp streams
+    weights when memory is tight.
+    """
+    import subprocess
+    cmd = [
+        str(sd_cli),
+        "--log-level", "warn",
+        "--diffusion-model", str(dit),
+        "--vae", str(vae),
+        "--llm", str(llm),
+        "--llm_vision", str(mmproj),
+        "-p", prompt,
+        "-o", str(outpath),
+        "-W", str(width),
+        "-H", str(height),
+        "--steps", str(steps),
+        "--cfg-scale", str(cfg),
+        "--sampling-method", "euler",
+        "-s", str(seed),
+    ]
+    for r in ref_paths:
+        cmd += ["-r", str(r)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    for line in proc.stderr:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        if ("[INFO" in line) or (line.strip().startswith("|") and "[INFO" not in line and "[WARN" not in line and "[ERROR" not in line):
+            continue
+        print(line, file=sys.stderr)
+    rc = proc.wait()
+    if rc != 0:
+        print("Error: sd-cli failed. The binary must support FLUX.3 (stable-diffusion.cpp master, leejet/stable-diffusion.cpp#2143).", file=sys.stderr)
+        raise subprocess.CalledProcessError(rc, cmd)
 
 def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, steps, cfg, seed, ref_paths, output_resolution=QWEN21_DEFAULT_MAX_SIDE, sampler=QWEN21_SD_SAMPLER, scheduler="", lora_path=None, lora_strength=1.0):
     """Run Qwen-Image-2.1 through stable-diffusion.cpp (sd-cli) with native GGUF quantization.
@@ -312,6 +430,11 @@ def main():
     parser.add_argument("--flux3-quant", default="bf16", choices=["bf16", "fp8r", "nvfp4"], help="FLUX.3 transformer weights: bf16 (default, ~11.2 GB), fp8r (quantized single file, ~5.6 GB, fast kernels on Ada/Hopper/Blackwell e.g. RTX 4090), or nvfp4 (Blackwell only, needs flashinfer)")
     parser.add_argument("--flux3-pup", action='store_true', help=f"Run the FLUX.3 prompt upsampler ({FLUX3_PUP_REPO}, ~18.8 GB download) on each prompt before the text encoder. Off by default: prompts are encoded as written. The model takes full scene captions, so either write them out or pass this flag")
     parser.add_argument("--flux3-refs-per-image", type=int, default=1, help="FLUX.3 only: round-robin ref distribution like --qwen-refs-per-image (default: 1). 0 = single-image edit mode (the -i input only)")
+    parser.add_argument("--flux3-backend", default="auto", choices=["auto", "sd", "diffusers"], help="FLUX.3 engine: sd (stable-diffusion.cpp; runs the uncensored AtomicChat GGUFs — quantized DiT + refusal-free Qwen3-VL encoder, the --nsfw route), diffusers (BFL's gated HF weights), or auto (sd when -nsfw, else diffusers) (default: auto)")
+    parser.add_argument("--flux3-gguf", help=f"FLUX.3 diffusion GGUF for --flux3-backend sd (default: {FLUX3_SD_DIT} from {FLUX3_SD_DIT_REPO})")
+    parser.add_argument("--flux3-llm", help=f"FLUX.3 text encoder GGUF for --flux3-backend sd (default: {FLUX3_SD_TE} from {FLUX3_SD_TE_REPO})")
+    parser.add_argument("--flux3-pup-gguf", help=f"FLUX.3 prompt upsampler GGUF for --flux3-backend sd --flux3-pup (default: {FLUX3_PUP_SD_GGUF} from {FLUX3_PUP_SD_REPO})")
+    parser.add_argument("--flux3-llama-cli", help=f"llama.cpp llama-cli binary for the sd prompt upsampler (default: {FLUX3_LLAMA_CLI}, or llama-cli on PATH)")
     parser.add_argument('--offset', type=int, default=0, help='Start reading prompt file from this line (default: 0)')
     parser.add_argument('-nc', '--no-clobber', action='store_true', dest='nc', help='No Clobber')
 
@@ -456,6 +579,43 @@ def main():
                 print(f"Qwen-Image-2.1 LoRA: {qwen_lora} (strength {args.qwen_lora_strength}, sampler {args.qwen_sampler}, scheduler {args.qwen_scheduler or 'model default'})", file=sys.stderr)
                 if args.qwen_sampler != "er_sde" or args.qwen_scheduler != "beta":
                     print("       Note: the LoRA author documents er_sde + beta scheduler + >=25 steps; pass --qwen-sampler er_sde --qwen-scheduler beta.", file=sys.stderr)
+
+    if args.model == "flux3":
+        flux3_sd = False
+        if args.flux3_backend == "sd":
+            flux3_sd = True
+        elif args.flux3_backend == "auto":
+            flux3_sd = bool(args.nsfw)
+        if args.nsfw and args.flux3_backend == "diffusers":
+            print("Warning: -nsfw wants the uncensored GGUF encoder (sd.cpp only); --flux3-backend diffusers runs BFL's stock encoder and ignores it", file=sys.stderr)
+        if flux3_sd:
+            flux3_gguf = Path(args.flux3_gguf) if args.flux3_gguf else fetch_flux3_sd_file(FLUX3_SD_DIT_REPO, FLUX3_SD_DIT)
+            flux3_llm = Path(args.flux3_llm) if args.flux3_llm else fetch_flux3_sd_file(FLUX3_SD_TE_REPO, FLUX3_SD_TE)
+            flux3_vae = fetch_flux3_sd_file(FLUX3_SD_DIT_REPO, FLUX3_SD_VAE)
+            flux3_mmproj = fetch_flux3_sd_file(FLUX3_SD_MMPROJ_REPO, FLUX3_SD_MMPROJ)
+            flux3_sd_is_base = flux3_gguf.name.endswith("-base")
+            flux3_steps_default = FLUX3_BASE_STEPS if flux3_sd_is_base else FLUX3_DISTILLED_STEPS
+            if args.flux3_pup:
+                flux3_pup_gguf = Path(args.flux3_pup_gguf) if args.flux3_pup_gguf else fetch_flux3_sd_file(FLUX3_PUP_SD_REPO, FLUX3_PUP_SD_GGUF)
+                flux3_pup_mmproj = fetch_flux3_sd_file(FLUX3_PUP_SD_REPO, FLUX3_PUP_SD_MMPROJ)
+                flux3_pup_prompts = fetch_flux3_sd_file(FLUX3_PUP_SD_REPO, FLUX3_PUP_SD_PROMPTS)
+                _llama = Path(args.flux3_llama_cli) if args.flux3_llama_cli else (FLUX3_LLAMA_CLI if FLUX3_LLAMA_CLI.exists() else (shutil.which("llama-cli") or None))
+                llama_cli = Path(_llama) if _llama else None
+                if not llama_cli or not llama_cli.exists():
+                    print(f"Error: --flux3-pup with the sd.cpp backend needs llama.cpp's llama-cli (not found at {FLUX3_LLAMA_CLI} or on PATH).", file=sys.stderr)
+                    print("       Build llama.cpp into ~/.cache/flux-batch/llama.cpp/ or pass --flux3-llama-cli.", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                flux3_pup_gguf = None
+                print("FLUX.3 sd.cpp: prompt upsampler off - short prompts give generic pictures (Klein wants full scene captions). Pass --flux3-pup to expand each request first.", file=sys.stderr)
+            if not FLUX3_SD_CLI.exists():
+                print(f"Error: --flux3-backend sd needs sd-cli at {FLUX3_SD_CLI}", file=sys.stderr)
+                print("       Build stable-diffusion.cpp master with FLUX.3 support (leejet/stable-diffusion.cpp#2143) into ~/.cache/flux-batch/sd-cpp/.", file=sys.stderr)
+                sys.exit(1)
+            if not args.nsfw:
+                print(f"Note: the sd.cpp path uses the uncensored AtomicChat releases ({FLUX3_SD_TE_REPO}); pass --nsfw to make that explicit", file=sys.stderr)
+            _pup_note = f", pup {flux3_pup_gguf.name}" if flux3_pup_gguf else ""
+            print(f"FLUX.3 sd.cpp backend (uncensored): DiT {flux3_gguf.name}, encoder {flux3_llm.name}{_pup_note} - {flux3_steps_default} steps, sd-cli {FLUX3_SD_CLI}", file=sys.stderr)
 
     if args.model == "hidream":
         hidream_src = LORA_CACHE_DIR.parent / "hidream" / "HiDream-O1-Image"  # cached at ~/.cache/flux-batch/hidream/HiDream-O1-Image
@@ -698,79 +858,83 @@ def main():
             t1 = time.time()
             print(f"Qwen-Image-2.1 model ready in {t1 - t0:.1f}s", file=sys.stderr)
     elif args.model == "flux3":
-        import diffusers as _flux3_diffusers
-        if not hasattr(_flux3_diffusers, "Flux3Transformer2DModel"):
-            print("Error: --model flux3 requires a diffusers build with FLUX.3 support (Flux3Transformer2DModel, ModularPipeline).", file=sys.stderr)
-            print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers' 'transformers>=5.17'", file=sys.stderr)
-            sys.exit(1)
-        from diffusers import ComponentsManager, ModularPipeline
-        flux3_model = args.flux3_model
-        flux3_is_base = flux3_model.rstrip("/").split("/")[-1].endswith("-base")
-        flux3_steps_default = FLUX3_BASE_STEPS if flux3_is_base else FLUX3_DISTILLED_STEPS
-        t0 = time.time()
-        print(f"Loading FLUX.3 Image Klein from {flux3_model} (transformer: {args.flux3_quant}) ...", file=sys.stderr)
-        # Automatic CPU offload: bf16 the model is ~20 GB (11.2 GB DiT + ~8 GB Qwen3-VL-4B
-        # encoder) so one component lives on the GPU at a time, same as the other backends.
-        manager = ComponentsManager()
-        manager.enable_auto_cpu_offload(device=args.device)
-        try:
-            pipe = ModularPipeline.from_pretrained(flux3_model, components_manager=manager)
-        except Exception as e:
-            print(f"Error: failed to load {flux3_model}: {e}", file=sys.stderr)
-            print("       This repo is gated: accept the FLUX Kommunity License on the model page,", file=sys.stderr)
-            print("       then `huggingface-cli login` (or export HF_TOKEN) and retry.", file=sys.stderr)
-            sys.exit(1)
-        if args.flux3_pup:
-            print(f"FLUX.3 prompt upsampler on: {FLUX3_PUP_REPO} (~18.8 GB, downloaded on first use; expands the prompt + refs into a scene caption per image)", file=sys.stderr)
+        if flux3_sd:
+            pipe = None
+            print("FLUX.3 sd.cpp backend ready (no diffusers weights loaded)", file=sys.stderr)
         else:
-            # The prompt upsampler is a separate 9B LLM the pipeline runs before the text
-            # encoder. Pop the block so prompts are encoded as written (--flux3-pup keeps it).
-            # NB: `pipe.blocks` is a read-only deepcopy property; the live execution blocks
-            # are `pipe._blocks`. Popping before load_components keeps the pup out of the
-            # workflow's component list, so it is not downloaded.
-            pipe._blocks.sub_blocks.pop("prompt_upsampler")
-            print("FLUX.3 prompt upsampler off: prompts are encoded as written. The model takes full scene captions - write them out, or pass --flux3-pup.", file=sys.stderr)
-        _flux3_dtype = {"vae": torch.float32, "default": torch.bfloat16} if flux3_is_base else torch.bfloat16
-        if args.flux3_quant == "bf16":
-            pipe.load_components(workflow="image_conditioned", dtype=_flux3_dtype)
-        else:
-            try:
-                from diffusers import BFLQuantizationConfig, Flux3Transformer2DModel
-            except ImportError:
-                print(f"Error: --flux3-quant {args.flux3_quant} needs BFLQuantizationConfig (newer diffusers build).", file=sys.stderr)
-                print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers'", file=sys.stderr)
+            import diffusers as _flux3_diffusers
+            if not hasattr(_flux3_diffusers, "Flux3Transformer2DModel"):
+                print("Error: --model flux3 requires a diffusers build with FLUX.3 support (Flux3Transformer2DModel, ModularPipeline).", file=sys.stderr)
+                print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers' 'transformers>=5.17'", file=sys.stderr)
                 sys.exit(1)
-            # Load everything the workflow needs except the transformer, then swap in the
-            # quantized single file (skips the 11.2 GB bf16 download).
-            _wf_names = {spec.name for spec in pipe.blocks.get_workflow("image_conditioned").expected_components}
-            pipe.load_components(names=[n for n in _wf_names if n != "transformer"], dtype=_flux3_dtype)
-            # from_single_file takes a local file or a repo_id/weights_name path (a full
-            # https:// URL gets mangled), so fetch the variant file into the HF cache first
-            from huggingface_hub import hf_hub_download
-            _variant_path = hf_hub_download(flux3_model, f"variants/{args.flux3_quant}/model.safetensors")
-            print(f"Loading {args.flux3_quant} transformer from {_variant_path} ...", file=sys.stderr)
-            transformer = Flux3Transformer2DModel.from_single_file(
-                _variant_path,
-                config=flux3_model,
-                subfolder="transformer",
-                quantization_config=BFLQuantizationConfig(compute_dtype=torch.bfloat16),
-                dtype=torch.bfloat16,
-            )
-            pipe.update_components(transformer=transformer)
-        if getattr(pipe, "transformer", None) is None:
-            print(f"Error: the FLUX.3 transformer did not load from {flux3_model}.", file=sys.stderr)
-            print("       This repo is gated: accept the FLUX Kommunity License on the model page,", file=sys.stderr)
-            print("       then `huggingface-cli login` (or export HF_TOKEN) and retry.", file=sys.stderr)
-            sys.exit(1)
-        if flux3_is_base:
-            # Undistilled checkpoint: 50 steps with classifier-free guidance (default 3.5)
-            flux3_guidance = args.guidance_scale if args.guidance_scale is not None else FLUX3_BASE_GUIDANCE
-            pipe.guider = pipe.guider.new(guidance_scale=flux3_guidance)
-            print(f"FLUX.3 base: {flux3_steps_default} steps, guidance {flux3_guidance}", file=sys.stderr)
-        elif args.guidance_scale is not None:
-            print("Warning: the distilled FLUX.3 checkpoint is flow-map distilled (no CFG); --guidance-scale has no effect. Use --flux3-model ...-base for CFG.", file=sys.stderr)
-        t1 = time.time()
-        print(f"FLUX.3 model ready in {t1 - t0:.1f}s (auto CPU offload on {args.device})", file=sys.stderr)
+            from diffusers import ComponentsManager, ModularPipeline
+            flux3_model = args.flux3_model
+            flux3_is_base = flux3_model.rstrip("/").split("/")[-1].endswith("-base")
+            flux3_steps_default = FLUX3_BASE_STEPS if flux3_is_base else FLUX3_DISTILLED_STEPS
+            t0 = time.time()
+            print(f"Loading FLUX.3 Image Klein from {flux3_model} (transformer: {args.flux3_quant}) ...", file=sys.stderr)
+            # Automatic CPU offload: bf16 the model is ~20 GB (11.2 GB DiT + ~8 GB Qwen3-VL-4B
+            # encoder) so one component lives on the GPU at a time, same as the other backends.
+            manager = ComponentsManager()
+            manager.enable_auto_cpu_offload(device=args.device)
+            try:
+                pipe = ModularPipeline.from_pretrained(flux3_model, components_manager=manager)
+            except Exception as e:
+                print(f"Error: failed to load {flux3_model}: {e}", file=sys.stderr)
+                print("       This repo is gated: accept the FLUX Kommunity License on the model page,", file=sys.stderr)
+                print("       then `huggingface-cli login` (or export HF_TOKEN) and retry.", file=sys.stderr)
+                sys.exit(1)
+            if args.flux3_pup:
+                print(f"FLUX.3 prompt upsampler on: {FLUX3_PUP_REPO} (~18.8 GB, downloaded on first use; expands the prompt + refs into a scene caption per image)", file=sys.stderr)
+            else:
+                # The prompt upsampler is a separate 9B LLM the pipeline runs before the text
+                # encoder. Pop the block so prompts are encoded as written (--flux3-pup keeps it).
+                # NB: `pipe.blocks` is a read-only deepcopy property; the live execution blocks
+                # are `pipe._blocks`. Popping before load_components keeps the pup out of the
+                # workflow's component list, so it is not downloaded.
+                pipe._blocks.sub_blocks.pop("prompt_upsampler")
+                print("FLUX.3 prompt upsampler off: prompts are encoded as written. The model takes full scene captions - write them out, or pass --flux3-pup.", file=sys.stderr)
+            _flux3_dtype = {"vae": torch.float32, "default": torch.bfloat16} if flux3_is_base else torch.bfloat16
+            if args.flux3_quant == "bf16":
+                pipe.load_components(workflow="image_conditioned", dtype=_flux3_dtype)
+            else:
+                try:
+                    from diffusers import BFLQuantizationConfig, Flux3Transformer2DModel
+                except ImportError:
+                    print(f"Error: --flux3-quant {args.flux3_quant} needs BFLQuantizationConfig (newer diffusers build).", file=sys.stderr)
+                    print("       Install: pip install -U 'git+https://github.com/huggingface/diffusers'", file=sys.stderr)
+                    sys.exit(1)
+                # Load everything the workflow needs except the transformer, then swap in the
+                # quantized single file (skips the 11.2 GB bf16 download).
+                _wf_names = {spec.name for spec in pipe.blocks.get_workflow("image_conditioned").expected_components}
+                pipe.load_components(names=[n for n in _wf_names if n != "transformer"], dtype=_flux3_dtype)
+                # from_single_file takes a local file or a repo_id/weights_name path (a full
+                # https:// URL gets mangled), so fetch the variant file into the HF cache first
+                from huggingface_hub import hf_hub_download
+                _variant_path = hf_hub_download(flux3_model, f"variants/{args.flux3_quant}/model.safetensors")
+                print(f"Loading {args.flux3_quant} transformer from {_variant_path} ...", file=sys.stderr)
+                transformer = Flux3Transformer2DModel.from_single_file(
+                    _variant_path,
+                    config=flux3_model,
+                    subfolder="transformer",
+                    quantization_config=BFLQuantizationConfig(compute_dtype=torch.bfloat16),
+                    dtype=torch.bfloat16,
+                )
+                pipe.update_components(transformer=transformer)
+            if getattr(pipe, "transformer", None) is None:
+                print(f"Error: the FLUX.3 transformer did not load from {flux3_model}.", file=sys.stderr)
+                print("       This repo is gated: accept the FLUX Kommunity License on the model page,", file=sys.stderr)
+                print("       then `huggingface-cli login` (or export HF_TOKEN) and retry.", file=sys.stderr)
+                sys.exit(1)
+            if flux3_is_base:
+                # Undistilled checkpoint: 50 steps with classifier-free guidance (default 3.5)
+                flux3_guidance = args.guidance_scale if args.guidance_scale is not None else FLUX3_BASE_GUIDANCE
+                pipe.guider = pipe.guider.new(guidance_scale=flux3_guidance)
+                print(f"FLUX.3 base: {flux3_steps_default} steps, guidance {flux3_guidance}", file=sys.stderr)
+            elif args.guidance_scale is not None:
+                print("Warning: the distilled FLUX.3 checkpoint is flow-map distilled (no CFG); --guidance-scale has no effect. Use --flux3-model ...-base for CFG.", file=sys.stderr)
+            t1 = time.time()
+            print(f"FLUX.3 model ready in {t1 - t0:.1f}s (auto CPU offload on {args.device})", file=sys.stderr)
     elif args.skeleton:
         from transformers import AutoModel, AutoTokenizer
         print(f"Loading ControlNet pipeline with {args.controlnet} ...", file=sys.stderr)
@@ -1106,20 +1270,38 @@ def main():
                     i, input_image, inpath, inline_ref_paths, inline_ref_images, cum_outs,
                     ref_file_content, ref_file_images, args.flux3_refs_per_image,
                     FLUX3_MAX_CONDITION_IMAGES, "flux3")
-                generator = torch.Generator(device=args.device).manual_seed(args.seed)
-                pipe_kwargs = dict(
-                    prompt=prompt,
-                    height=h & ~0xf,
-                    width=w & ~0xf,
-                    num_inference_steps=flux3_steps,
-                    generator=generator,
-                    output="images",
-                )
-                if refs_for_flux3:
-                    pipe_kwargs["image"] = refs_for_flux3[0] if len(refs_for_flux3) == 1 else refs_for_flux3
-                result = pipe(**pipe_kwargs)
-                image = result[0]
-                write_image(image, outpath, prompt, args.seed)
+                if flux3_sd:
+                    _tmpdir = Path(tempfile.mkdtemp(prefix="flux-batch-flux3-"))
+                    ref_paths = []
+                    for _k, _img in enumerate(refs_for_flux3):
+                        _p = _tmpdir / f"ref{_k}.png"
+                        _img.save(_p)
+                        ref_paths.append(_p)
+                    caption = prompt
+                    if flux3_pup_gguf:
+                        t_pup = time.time()
+                        caption = run_flux3_pup(llama_cli, flux3_pup_gguf, flux3_pup_mmproj, flux3_pup_prompts, prompt, ref_paths, w, h)
+                        print(f"FLUX.3 pup: {len(caption)} chars in {time.time() - t_pup:.1f}s", file=sys.stderr)
+                    _cfg = args.guidance_scale if args.guidance_scale is not None else (FLUX3_BASE_GUIDANCE if flux3_sd_is_base else FLUX3_SD_CFG)
+                    run_sd_flux3(FLUX3_SD_CLI, flux3_gguf, flux3_llm, flux3_mmproj, flux3_vae,
+                                 caption, outpath, w & ~0xf, h & ~0xf, flux3_steps, _cfg, args.seed, ref_paths)
+                    image = Image.open(outpath)
+                    write_image(image, outpath, prompt, args.seed)
+                else:
+                    generator = torch.Generator(device=args.device).manual_seed(args.seed)
+                    pipe_kwargs = dict(
+                        prompt=prompt,
+                        height=h & ~0xf,
+                        width=w & ~0xf,
+                        num_inference_steps=flux3_steps,
+                        generator=generator,
+                        output="images",
+                    )
+                    if refs_for_flux3:
+                        pipe_kwargs["image"] = refs_for_flux3[0] if len(refs_for_flux3) == 1 else refs_for_flux3
+                    result = pipe(**pipe_kwargs)
+                    image = result[0]
+                    write_image(image, outpath, prompt, args.seed)
                 if args.cumulative:
                     cum_outs.append(image)
                 elapsed = time.time() - t_start
