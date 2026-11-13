@@ -6,6 +6,8 @@ Run the same prompt across many images with dynamic prompting, static and dynami
 
 Repos, GGUFs, and other dependencies are cached under `~/.cache/flux-batch/`.
 
+A second, simpler entrypoint — **`flux-batch`** — runs FLUX.2 [klein] or **BRIA Fibo 2.0** (GGUF) with a single prompt across a batch; see [BRIA Fibo 2.0 Mode](#bria-fibo-20-mode-flux-batch).
+
 ### Installation
 
 ```bash
@@ -301,6 +303,38 @@ Requires `sd-cli` built from stable-diffusion.cpp `master` with FLUX.3 support (
 ```bash
 edit-batch --model flux3 --flux3-model black-forest-labs/flux-3-image-klein-base -s 50 --guidance-scale 3.5 -o out/ -p prompt.txt
 ```
+
+### BRIA Fibo 2.0 Mode (`flux-batch`)
+
+A separate, lighter entrypoint (`flux-batch`, not `edit-batch`) for FLUX.2 [klein] and BRIA Fibo 2.0 community GGUFs. It takes one prompt file and applies it across an input glob (or does text-to-image with no `-in`). Fibo 2.0 needs `diffusers>=0.42` (first release with `BriaFibo2Pipeline`) and accepted [BRIA Fibo 2.0](https://huggingface.co/briaai/Fibo-2.0-dev) (CC BY-NC 4.0) / [Edit Turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) licenses; the text encoder (Qwen3-VL 4B) and VAE load from those gated repos.
+
+| `--model` | Base | GGUF (default Q4_0) | Defaults |
+|-----------|------|---------------------|----------|
+| `klein` (default) | FLUX.2 klein 9B — t2i + editing | [unsloth/FLUX.2-klein-9B-GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF) | 4 steps, guidance 4.0 |
+| `fibo2` | BRIA Fibo 2.0 Dev — t2i + editing | [realrebelai/Fibo-2.0_GGUFs](https://huggingface.co/realrebelai/Fibo-2.0_GGUFs) | 30 steps, guidance 5.0 |
+| `fibo2-turbo` | BRIA Fibo 2.0 Edit Turbo — **editing only** | [realrebelai/Fibo-2.0_GGUFs](https://huggingface.co/realrebelai/Fibo-2.0_GGUFs) | 4 steps, guidance 1.0 |
+
+Per-model defaults apply unless overridden with `--gguf`, `--steps`, or `--guidance`. The rebel GGUF repo also has Q5_0/Q8_0 variants (higher quality, more VRAM); the `*_w4a8_convrot.safetensors` / ComfyUI int8-convrot files use rotated weights and are **not** supported.
+
+```bash
+# klein: batch edit
+flux-batch -in "*.jpg" -out new/ 'repaint this as a disney cartoon'
+
+# fibo2: text-to-image
+flux-batch --model fibo2 -out new/ 'a red vintage bicycle on a narrow mediterranean street'
+
+# fibo2-turbo: fast batch edit
+flux-batch --model fibo2-turbo -in "*.jpg" -out new/ 'make the background a snowy forest'
+
+# fibo2: edit one image plus a reference (addressed as <image_2>)
+flux-batch --model fibo2 -p p.txt -in "photo.jpg" --ref "palette.png" -out new/ 'repaint <image_1> using the colors of <image_2>'
+```
+
+Text-to-image mode (no `-in`) writes `img-<n>.png`. The prompt file is reread before each image (only the first line), so you can edit it mid-batch; edit outputs match the input aspect ratio (rounded down to a multiple of 16).
+
+**Fibo 2.0 prompts (structured captions):** Fibo accepts freeform text but was trained on structured JSON captions. If the prompt line starts with `{` it is passed through as-is, e.g. `{"short_description": "...", "objects": [...], "background_setting": "...", "lighting": {...}, "style_medium": "photograph"}`. For edits, combine an instruction with a caption of the result: `{"edit_instruction": "make it winter", "short_description": "the same bicycle on a snowy street"}`.
+
+**How the Fibo 2.0 GGUF loading works:** diffusers has no single-file path for `BriaFibo2Transformer2DModel`, so `fibo2_loader.py` maps the community GGUF tensors (native ComfyUI names) onto the diffusers layout — verified bit-exact against the bf16 weights in [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev): fused `attention.qkv` → `to_q`/`to_k`/`to_v` (3-way row split), `to_kv` → `to_k`/`to_v` (2-way split), `feed_forward.w13` → `w1`/`w3` (dropping the 9728→9536 zero padding), `feed_forward.w2` trimmed to 9536 in-features, and everything else (norms, biases, adaLN, gates, embedders, `latent_queries`) direct. Q4_0/Q5_0/Q8_0 tensors stay quantized inside `GGUFLinear` layers; BF16/F32 tensors are dequantized once at load.
 
 ### Skeleton ControlNet Mode
 
