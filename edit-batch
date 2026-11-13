@@ -90,6 +90,24 @@ FLUX3_PUP_SD_PROMPTS = "system_prompts.json"
 FLUX3_SD_CFG = 1.0  # distilled schedule: 16 steps, CFG 1, euler, BFL's default time shift
 FLUX3_LLAMA_CLI = Path.home() / ".cache" / "flux-batch" / "llama.cpp" / "llama-cli"
 
+# MiniMax-H3-Image on stable-diffusion.cpp (--model minimax). A 20.1B DiT (33B minus
+# audio) distilled to exactly 6 steps at CFG 1 with one output head per step, a
+# Qwen3-VL-32B text encoder, and the H3 image VAE. AtomicChat's AD-Q4_K DiT (importance-
+# matrix quantization, 11.6 GB) + unsloth's Q4_K_M encoder (18.2 GB, vision tower
+# included for -r edits) + Comfy-Org's fp16 VAE. Auto-downloaded to MM3_SD_DIR.
+MM3_SD_DIR = Path.home() / ".cache" / "flux-batch" / "minimax-h3-sd"
+MM3_SD_DIT_REPO = "AtomicChat/MiniMax-H3-Image-GGUF"
+MM3_SD_DIT = "MiniMax-H3-Image-AD-Q4_K.gguf"  # 11.6 GB; AD-Q5_K/Q6_K/Q8_0 are higher quality if VRAM allows
+MM3_SD_TE_REPO = "unsloth/MiniMax-H3-GGUF"
+MM3_SD_TE = "qwen3vl_32b_minimax_h3-Q4_K_M.gguf"  # 18.2 GB Qwen3-VL-32B, vision tower included
+MM3_SD_VAE_REPO = "Comfy-Org/MiniMax-H3-Image"
+MM3_SD_VAE = "vae/minimax_h3_image_vae_fp16.safetensors"
+MM3_STEPS = 6  # fixed: per-step output heads are distilled for exactly 6 steps
+MM3_CFG = 1.0  # guidance-distilled, no CFG
+MM3_SIGMAS = "minimax-h3-image"  # the checkpoint's own sample_sigmas schedule
+MM3_MAX_CONDITION_IMAGES = 16  # the model supports up to 16 reference images
+MM3_DEFAULT_MAX_SIDE = 2048  # 2 MP default; the model's working range is 4-20 MP (raise with -w/-h)
+
 LORA_CACHE_DIR = Path.home() / ".cache" / "flux-batch" / "loras"
 LORA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -129,6 +147,19 @@ def fetch_flux3_sd_file(repo, filename):
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading {repo}/{filename} -> {dest} ...", file=sys.stderr)
     return Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=FLUX3_SD_DIR))
+
+def fetch_mm3_sd_file(repo, filename):
+    """Download one MiniMax-H3-Image sd.cpp file from Hugging Face into the local cache dir.
+
+    Returns the local path; no network access when the file is already present.
+    """
+    dest = MM3_SD_DIR / filename
+    if dest.exists():
+        return dest
+    from huggingface_hub import hf_hub_download
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {repo}/{filename} -> {dest} ...", file=sys.stderr)
+    return Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=MM3_SD_DIR))
 
 def run_flux3_pup(llama_cli, pup_gguf, mmproj, sysprompts_path, prompt, ref_paths, width, height):
     """Expand a short request into a full Klein caption via the uncensored prompt upsampler.
@@ -217,6 +248,46 @@ def run_sd_flux3(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, 
     rc = proc.wait()
     if rc != 0:
         print("Error: sd-cli failed. The binary must support FLUX.3 (stable-diffusion.cpp master, leejet/stable-diffusion.cpp#2143).", file=sys.stderr)
+        raise subprocess.CalledProcessError(rc, cmd)
+
+def run_sd_mm3(sd_cli, dit, llm, vae, prompt, outpath, width, height, seed, ref_paths):
+    """Run MiniMax-H3-Image through stable-diffusion.cpp (sd-cli) with GGUF weights.
+
+    Distilled to 6 steps at CFG 1 on the checkpoint's own sigma schedule (per-step
+    output heads, so the step count is not overridable). The AD-Q4_K DiT (11.6 GB)
+    and the Q4_K_M Qwen3-VL-32B encoder (18.2 GB) stream through ~24 GB VRAM; the
+    encoder GGUF carries its vision tower, so -r reference edits need no mmproj.
+    """
+    import subprocess
+    cmd = [
+        str(sd_cli),
+        "--log-level", "warn",
+        "--diffusion-model", str(dit),
+        "--vae", str(vae),
+        "--llm", str(llm),
+        "-p", prompt,
+        "-o", str(outpath),
+        "-W", str(width),
+        "-H", str(height),
+        "--steps", str(MM3_STEPS),
+        "--cfg-scale", str(MM3_CFG),
+        "--sigmas", MM3_SIGMAS,
+        "--diffusion-fa",
+        "-s", str(seed),
+    ]
+    for r in ref_paths:
+        cmd += ["-r", str(r)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    for line in proc.stderr:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        if ("[INFO" in line) or (line.strip().startswith("|") and "[INFO" not in line and "[WARN" not in line and "[ERROR" not in line):
+            continue
+        print(line, file=sys.stderr)
+    rc = proc.wait()
+    if rc != 0:
+        print("Error: sd-cli failed. The binary must support MiniMax-H3-Image (stable-diffusion.cpp master-1088 or newer, leejet/stable-diffusion.cpp#2324).", file=sys.stderr)
         raise subprocess.CalledProcessError(rc, cmd)
 
 def run_sd_qwen(sd_cli, dit, llm, mmproj, vae, prompt, outpath, width, height, steps, cfg, seed, ref_paths, output_resolution=QWEN21_DEFAULT_MAX_SIDE, sampler=QWEN21_SD_SAMPLER, scheduler="", lora_path=None, lora_strength=1.0):
@@ -413,7 +484,7 @@ def main():
     ## -h is help
     parser.add_argument("--height", type=int, help="Explicit output height (enforced)")
     parser.add_argument("-i", "--in", dest="input_glob", help="Glob pattern for input images (e.g. '*.jpg')")
-    parser.add_argument("-m", "--model", default="flux", choices=["flux", "hidream", "boogu", "qwen-image-2.1", "flux3"], help="Model to use (default: flux)")
+    parser.add_argument("-m", "--model", default="flux", choices=["flux", "hidream", "boogu", "qwen-image-2.1", "flux3", "minimax"], help="Model to use (default: flux)")
     parser.add_argument("-o", "--out", required=True, dest="output_dir", help="Directory to write output images")
     parser.add_argument("-p", "--prompt", required=True, help="Prompt from a file applied to every image")
     parser.add_argument("-r", "--ref", action="append", dest="refs", metavar="IMAGE", help="Reference image(s), can be specified multiple times")
@@ -442,6 +513,10 @@ def main():
     parser.add_argument("--flux3-llm", help=f"FLUX.3 text encoder GGUF for --flux3-backend sd (default: {FLUX3_SD_TE} from {FLUX3_SD_TE_REPO})")
     parser.add_argument("--flux3-pup-gguf", help=f"FLUX.3 prompt upsampler GGUF for --flux3-backend sd --flux3-pup (default: {FLUX3_PUP_SD_GGUF} from {FLUX3_PUP_SD_REPO})")
     parser.add_argument("--flux3-llama-cli", help=f"llama.cpp llama-cli binary for the sd prompt upsampler (default: {FLUX3_LLAMA_CLI}, or llama-cli on PATH)")
+    parser.add_argument("--mm3-gguf", help=f"MiniMax-H3-Image diffusion GGUF for --model minimax (default: {MM3_SD_DIT} from {MM3_SD_DIT_REPO})")
+    parser.add_argument("--mm3-llm", help=f"MiniMax-H3-Image text encoder GGUF for --model minimax (default: {MM3_SD_TE} from {MM3_SD_TE_REPO})")
+    parser.add_argument("--mm3-vae", help=f"MiniMax-H3-Image VAE for --model minimax (default: {MM3_SD_VAE} from {MM3_SD_VAE_REPO})")
+    parser.add_argument("--mm3-refs-per-image", type=int, default=1, help="MiniMax-H3-Image only: round-robin ref distribution like --qwen-refs-per-image (default: 1; up to 16 refs are supported). 0 = single-image edit mode (the -i input only)")
     parser.add_argument('--offset', type=int, default=0, help='Start reading prompt file from this line (default: 0)')
     parser.add_argument('-nc', '--no-clobber', action='store_true', dest='nc', help='No Clobber')
 
@@ -623,6 +698,18 @@ def main():
                 print(f"Note: the sd.cpp path uses the uncensored AtomicChat releases ({FLUX3_SD_TE_REPO}); pass --nsfw to make that explicit", file=sys.stderr)
             _pup_note = f", pup {flux3_pup_gguf.name}" if flux3_pup_gguf else ""
             print(f"FLUX.3 sd.cpp backend (uncensored): DiT {flux3_gguf.name}, encoder {flux3_llm.name}{_pup_note} - {flux3_steps_default} steps, sd-cli {FLUX3_SD_CLI}", file=sys.stderr)
+
+    if args.model == "minimax":
+        mm3_gguf = Path(args.mm3_gguf) if args.mm3_gguf else fetch_mm3_sd_file(MM3_SD_DIT_REPO, MM3_SD_DIT)
+        mm3_llm = Path(args.mm3_llm) if args.mm3_llm else fetch_mm3_sd_file(MM3_SD_TE_REPO, MM3_SD_TE)
+        mm3_vae = Path(args.mm3_vae) if args.mm3_vae else fetch_mm3_sd_file(MM3_SD_VAE_REPO, MM3_SD_VAE)
+        if args.steps != 4 and args.steps != MM3_STEPS:
+            print(f"Note: MiniMax-H3-Image samples at exactly {MM3_STEPS} steps (per-step output heads); -s {args.steps} is ignored.", file=sys.stderr)
+        if not FLUX3_SD_CLI.exists():
+            print(f"Error: --model minimax needs sd-cli at {FLUX3_SD_CLI}", file=sys.stderr)
+            print("       Build stable-diffusion.cpp master-1088 or newer (MiniMax-H3-Image support, leejet/stable-diffusion.cpp#2324) into ~/.cache/flux-batch/sd-cpp/.", file=sys.stderr)
+            sys.exit(1)
+        print(f"MiniMax-H3-Image sd.cpp backend: DiT {mm3_gguf.name}, encoder {mm3_llm.name} - {MM3_STEPS} steps CFG 1, sd-cli {FLUX3_SD_CLI}", file=sys.stderr)
 
     if args.model == "hidream":
         hidream_src = LORA_CACHE_DIR.parent / "hidream" / "HiDream-O1-Image"  # cached at ~/.cache/flux-batch/hidream/HiDream-O1-Image
@@ -983,6 +1070,9 @@ def main():
         t1 = time.time()
         print(f"ControlNet pipeline ready in {t1 - t0:.1f}s", file=sys.stderr)
         skeleton_cache = {}
+    elif args.model == "minimax":
+        pipe = None
+        print("MiniMax-H3-Image sd.cpp backend ready (no diffusers weights loaded)", file=sys.stderr)
     else:
         from transformers import AutoModel, AutoTokenizer
         print(f"Loading GGUF {args.gguf} ...", file=sys.stderr)
@@ -1309,6 +1399,32 @@ def main():
                     result = pipe(**pipe_kwargs)
                     image = result[0]
                     write_image(image, outpath, prompt, args.seed)
+                if args.cumulative:
+                    cum_outs.append(image)
+                elapsed = time.time() - t_start
+                print(f"{elapsed:.1f}s -> {outpath}", file=sys.stderr)
+                continue
+
+            if args.model == "minimax":
+                if not (args.width or args.height or args.max_width or args.max_height):
+                    if max(w, h) > MM3_DEFAULT_MAX_SIDE:
+                        _clamp = MM3_DEFAULT_MAX_SIDE / max(w, h)
+                        w, h = int(w * _clamp), int(h * _clamp)
+                        print(f"MiniMax-H3-Image: clamped output to {w}x{h} (max side {MM3_DEFAULT_MAX_SIDE}; use -w/-h or --max-width/--max-height to raise)", file=sys.stderr)
+                refs_for_mm3, _mm3_labels, ref_file_content, ref_file_images = assemble_edit_refs(
+                    i, input_image, inpath, inline_ref_paths, inline_ref_images, cum_outs,
+                    ref_file_content, ref_file_images, args.mm3_refs_per_image,
+                    MM3_MAX_CONDITION_IMAGES, "minimax")
+                _tmpdir = Path(tempfile.mkdtemp(prefix="flux-batch-mm3-"))
+                ref_paths = []
+                for _k, _img in enumerate(refs_for_mm3):
+                    _p = _tmpdir / f"ref{_k}.png"
+                    _img.save(_p)
+                    ref_paths.append(_p)
+                run_sd_mm3(FLUX3_SD_CLI, mm3_gguf, mm3_llm, mm3_vae,
+                           prompt, outpath, w & ~0x1f, h & ~0x1f, args.seed, ref_paths)
+                image = Image.open(outpath)
+                write_image(image, outpath, prompt, args.seed)
                 if args.cumulative:
                     cum_outs.append(image)
                 elapsed = time.time() - t_start

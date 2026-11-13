@@ -1,6 +1,6 @@
 # edit-batch
 
-Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) including the uncensored models when available using both sd.cpp and transformers with hardware detection.
+Batch image processing with [FLUX.2 [klein 9B] Q4_K_M GGUF](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF), [FLUX.3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein), [MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image), [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image), [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit), or [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) including the uncensored models when available using both sd.cpp and transformers with hardware detection.
 
 Run the same prompt across many images with dynamic prompting, static and dynamic reference images, support for multiple generations and step count modification along with multiple text encoders and loras. Optionally use FLUX.3 Image Klein, HiDream-O1-Image, Boogu-Image-0.1-Edit, or Qwen-Image-2.1 as the backend model.
 
@@ -304,6 +304,28 @@ Requires `sd-cli` built from stable-diffusion.cpp `master` with FLUX.3 support (
 edit-batch --model flux3 --flux3-model black-forest-labs/flux-3-image-klein-base -s 50 --guidance-scale 3.5 -o out/ -p prompt.txt
 ```
 
+### MiniMax-H3-Image Mode
+
+MiniMax's 16-megapixel generation + editing model (33B H3 transformer without the audio layers), distilled to **exactly 6 steps at CFG 1** with one output head per step, and no negative prompt. It runs the same way as the FLUX.3 sd path: the GGUF DiT + text encoder + VAE go through `sd-cli` (Vulkan), all auto-downloaded to `~/.cache/flux-batch/minimax-h3-sd/` on first use.
+
+```bash
+# Image editing (input image is the edit target; references are <Picture 1>, <Picture 2>, ...)
+edit-batch -m minimax -i "in/*.jpg" -o out/ -p prompt.txt
+
+# Text-to-image
+edit-batch -m minimax -o out/ -p prompt.txt --width 2048 --height 2048
+```
+
+**Weights (all auto-downloaded):** DiT [AtomicChat/MiniMax-H3-Image-GGUF](https://huggingface.co/AtomicChat/MiniMax-H3-Image-GGUF) `MiniMax-H3-Image-AD-Q4_K.gguf` (11.6 GB, importance-matrix quantization — `AD-Q5_K`/`AD-Q6_K`/`Q8_0` are higher quality if you have the VRAM) · text encoder [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF) `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` (18.2 GB Qwen3-VL-32B; the vision tower is included, so `-i`/`-r` reference edits need no extra mmproj) · VAE [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image) `vae/minimax_h3_image_vae_fp16.safetensors` (1.2 GB).
+
+**Sizing:** the model's working range is ~4–20 MP (it is best around 16 MP: 4096×4096, 4736×3552, 5024×3360, 5472×3072, 6272×2688 and portrait swaps). The default max side is 2048; raise it with `-w`/`-h` (both sides are rounded to multiples of 32). On a 24 GB card, 2048² takes ~20–40 s per image and 4096² several minutes — the DiT and the 18 GB encoder stream through VRAM.
+
+**Prompts:** the model expects a long, complete English description of the whole image (MiniMax's API expands short prompts with H3-Image-Context-IR; there is no local upsampler wired in yet). For edits, name what to preserve, then what to change, then describe the target image in full. Up to 16 reference images are supported — `--mm3-refs-per-image` round-robins the pool like the other backends.
+
+**Steps are fixed at 6** (the per-step output heads are distilled for exactly 6 NFEs on the checkpoint's own sigma schedule), so `-s` is ignored and there is no guidance scale or negative prompt.
+
+**License:** the [MiniMax-H3-Image Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/main/LICENSE) is territorial (per the community quantizers' read of it, it excludes the US/EU/UK/KR) and forbids circumventing its safety guardrails — check it before use.
+
 ### BRIA Fibo 2.0 Mode (`flux-batch`)
 
 A separate, lighter entrypoint (`flux-batch`, not `edit-batch`) for FLUX.2 [klein] and BRIA Fibo 2.0 community GGUFs. It takes one prompt file and applies it across an input glob (or does text-to-image with no `-in`). Fibo 2.0 needs `diffusers>=0.42` (first release with `BriaFibo2Pipeline`) and accepted [BRIA Fibo 2.0](https://huggingface.co/briaai/Fibo-2.0-dev) (CC BY-NC 4.0) / [Edit Turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) licenses; the text encoder (Qwen3-VL 4B) and VAE load from those gated repos.
@@ -413,11 +435,15 @@ edit-batch --skeleton --skeleton-strength 0.8 -in "*.jpg" -out out/ -p prompt.tx
 | `--flux3-llm` | `Qwen3-VL-4B-Instruct-Uncensored-Q8_0.gguf` | FLUX.3 text encoder GGUF for the sd backend (auto-downloaded from `AtomicChat/FLUX-3-Image-Klein-TE-Uncensored-GGUF`) |
 | `--flux3-pup-gguf` | `FLUX-3-Image-Klein-pup-Uncensored-AD-IQ4_XS.gguf` | FLUX.3 prompt upsampler GGUF for the sd backend (auto-downloaded from `AtomicChat/FLUX-3-Image-Klein-pup-Uncensored-GGUF`) |
 | `--flux3-llama-cli` | `~/.cache/flux-batch/llama.cpp/llama-cli` or `PATH` | llama.cpp binary for the sd prompt upsampler |
+| `--mm3-gguf` | `MiniMax-H3-Image-AD-Q4_K.gguf` | MiniMax-H3-Image DiT GGUF for `-m minimax` (auto-downloaded from `AtomicChat/MiniMax-H3-Image-GGUF`) |
+| `--mm3-llm` | `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | MiniMax-H3-Image text encoder GGUF for `-m minimax` (auto-downloaded from `unsloth/MiniMax-H3-GGUF`) |
+| `--mm3-vae` | `vae/minimax_h3_image_vae_fp16.safetensors` | MiniMax-H3-Image VAE for `-m minimax` (auto-downloaded from `Comfy-Org/MiniMax-H3-Image`) |
+| `--mm3-refs-per-image` | `1` | MiniMax-H3-Image round-robin refs per output (up to 16 refs supported). `0` = input-only edit mode |
 | `--offset` | `0` | Start reading prompt file from this line (default: 0) |
 | `-rf` / `--ref-file` | — | File listing reference images (one per line); re-read each iteration like `--prompt`, reloads images only on content change |
 | `--shuf` | false | Shuffle input file order randomly |
 | `-nc` | false | No Clobber — skip existing outputs |
-| `--model` | `flux` | Model backend: `flux`, `hidream`, `boogu`, `qwen-image-2.1`, or `flux3` |
+| `--model` | `flux` | Model backend: `flux`, `hidream`, `boogu`, `qwen-image-2.1`, `flux3`, or `minimax` (MiniMax-H3-Image) |
 | `--model-type` | `full` | HiDream variant: `full` (25 steps) or `dev` (28 steps) |
 | `--guidance-scale` | * | HiDream guidance scale (5.0 full, 0.0 dev); also FLUX.3 base checkpoint CFG (default 3.5; no effect on the distilled checkpoint) |
 | `--text-guidance-scale` | `5.0` | Text guidance scale for Boogu |
